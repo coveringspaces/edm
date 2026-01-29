@@ -80,3 +80,39 @@ class EDMLoss:
         return loss
 
 #----------------------------------------------------------------------------
+# Simple Gaussian-path Conditional Flow Matching (CFM) loss.
+# Trains velocity v so that x = y + sigma*eps has dx/dsigma = eps.
+
+@persistence.persistent_class
+class CFMLoss:
+    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+        self.P_mean = P_mean
+        self.P_std = P_std
+        self.sigma_data = sigma_data
+
+    def __call__(self, net, images, labels=None, augment_pipe=None):
+        # Sample sigma exactly like EDMLoss (log-normal).
+        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp()  # (N,1,1,1)
+
+        # Optional augmentation (match EDMLoss).
+        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+
+        # Gaussian path: x = y + sigma*eps
+        eps = torch.randn_like(y)
+        x = y + sigma * eps
+
+        # Net returns D(x,sigma) = x - sigma*v_pred (with your CFMPrecond).
+        D_x = net(x, sigma, labels, augment_labels=augment_labels)
+
+        # Recover predicted velocity v_pred = (x - D_x)/sigma
+        v_pred = (x - D_x) / sigma
+
+        # Flow-matching regression target: v* = eps
+        loss = (v_pred - eps) ** 2
+
+        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        loss = weight * loss
+
+        return loss
+

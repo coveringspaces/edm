@@ -1,0 +1,15 @@
+# Outputs / data
+training-runs/
+datasets/
+downloads/
+fid-refs/
+cfm-samples/
+*.png
+*.pkl
+*.pt
+*.npz
+
+# Python cache
+__pycache__/
+*/__pycache__/
+*.pyc
