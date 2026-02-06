@@ -14,10 +14,12 @@ import click
 import tqdm
 import pickle
 import numpy as np
+import math
 import torch
 import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
+from training.networks import CFMPrecond
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -56,6 +58,64 @@ def edm_sampler(
             denoised = net(x_next, t_next, class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+    return x_next
+
+#----------------------------------------------------------------------------
+# Proposed TrigFlow sampler.
+
+def trigflow_cfm_sampler(
+    net, latents, class_labels=None, randn_like=torch.randn_like,
+    num_steps=64, sigma_min=0.002, sigma_max=80,
+):
+    """
+    Sampler for your TrigFlow CFMPrecond net.
+    - net(x, t) returns x0_hat
+    - integrates dx/dt = (cos(t)*x - x0_hat)/sin(t) backward from t_max to t_min
+    """
+    # Clamp sigma range to what the net supports.
+    sigma_min = max(sigma_min, getattr(net, "sigma_min", 0.0))
+    sigma_max = min(sigma_max, getattr(net, "sigma_max", float("inf")))
+
+    sigma_data = net.sigma_data
+    # Convert sigma endpoints to t endpoints.
+    t_max = math.atan(sigma_max / sigma_data)
+    t_min = math.atan(sigma_min / sigma_data)
+    # Avoid sin(t)=0 exactly.
+    t_min = max(t_min, 1e-4)
+
+    # Time grid (backwards).
+    t_steps = torch.linspace(t_max, t_min, num_steps + 1, device=latents.device, dtype=torch.float64)
+
+    # Initial condition: at large t, x ≈ sigma_data * N(0, I) --> initialize as noisy
+    x_next = latents.to(torch.float64) * sigma_data
+
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+        x_cur = x_next
+        dt = (t_next - t_cur)  # negative
+
+        # --- Euler/Heun in t with dx/dt = f(t,x)
+        alpha = torch.cos(t_cur)
+        s = torch.sin(t_cur).clamp(min=1e-6)
+
+        # net expects t shaped [B] or [B,1,1,1]
+        t_in = torch.full([x_cur.shape[0]], float(t_cur), device=x_cur.device, dtype=torch.float32)
+
+        x0_hat = net(x_cur.to(torch.float32), t_in, class_labels).to(torch.float64)
+        f_cur = (alpha * x_cur - x0_hat) / s # velocity at t_cur, i.e. dx/dt = f(t_cur, x_cur)
+
+        # Euler proposal
+        x_euler = x_cur + dt * f_cur
+
+        # Heun correction (2nd order)
+        alpha_n = torch.cos(t_next)
+        s_n = torch.sin(t_next).clamp(min=1e-6)
+        t_in_n = torch.full([x_cur.shape[0]], float(t_next), device=x_cur.device, dtype=torch.float32)
+
+        x0_hat_n = net(x_euler.to(torch.float32), t_in_n, class_labels).to(torch.float64)
+        f_n = (alpha_n * x_euler - x0_hat_n) / s_n
+
+        x_next = x_cur + dt * 0.5 * (f_cur + f_n)
 
     return x_next
 
@@ -288,10 +348,28 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
             class_labels[:, class_idx] = 1
 
         # Generate images.
+        # sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
+        # have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
+        # sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
+        # images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-        have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+
+        # --- Choose sampler based on network type ---
+        if isinstance(net, CFMPrecond):
+            images = trigflow_cfm_sampler(
+                net,
+                latents,
+                class_labels,
+                randn_like=rnd.randn_like,
+                num_steps=sampler_kwargs.get("num_steps", 64),
+                sigma_min=sampler_kwargs.get("sigma_min", 0.002),
+                sigma_max=sampler_kwargs.get("sigma_max", 80),
+            )
+        else:
+            have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
+            sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
+            images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+
 
         # Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()

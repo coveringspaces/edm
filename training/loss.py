@@ -85,34 +85,45 @@ class EDMLoss:
 
 @persistence.persistent_class
 class CFMLoss:
-    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, sigma_min=1e-3, sigma_max=80, t_epsilon=1e-4):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.t_epsilon = t_epsilon
 
     def __call__(self, net, images, labels=None, augment_pipe=None):
-        # Sample sigma exactly like EDMLoss (log-normal).
-        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()  # (N,1,1,1)
-
         # Optional augmentation (match EDMLoss).
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
 
-        # Gaussian path: x = y + sigma*eps
+        # Sample sigma ~ lognormal (EDM-style).
+        rnd_normal = torch.randn([y.shape[0], 1, 1, 1], device=y.device)
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        sigma = sigma.clamp(min=self.sigma_min, max=self.sigma_max)
+
+        # Convert sigma -> t for TrigFlow.
+        t = torch.atan(sigma / self.sigma_data)
+        # Optional safety so sin/cos never hit exact 0/1 due to numerical edge cases.
+        t = t.clamp(min=self.t_epsilon, max=0.5 * torch.pi - self.t_epsilon)
+
+        alpha = torch.cos(t)
+        s = torch.sin(t)
+
+        # TrigFlow forward path.
         eps = torch.randn_like(y)
-        x = y + sigma * eps
+        x = alpha * y + s * self.sigma_data * eps
 
-        # Net returns D(x,sigma) = x - sigma*v_pred (with your CFMPrecond).
-        D_x = net(x, sigma, labels, augment_labels=augment_labels)
+        # Net returns x0_hat.
+        x0_hat = net(x, t, labels, augment_labels=augment_labels)
 
-        # Recover predicted velocity v_pred = (x - D_x)/sigma
-        v_pred = (x - D_x) / sigma
+        # Recover v_pred from x0_hat:
+        # x0_hat = alpha*x - s*sigma_data*v  =>  v = (alpha*x - x0_hat)/(s*sigma_data)
+        denom = (s * self.sigma_data).clamp(min=1e-8)
+        v_pred = (alpha * x - x0_hat) / denom
 
-        # Flow-matching regression target: v* = eps
-        loss = (v_pred - eps) ** 2
+        # TrigFlow target velocity.
+        v_star = alpha * eps - s * (y / self.sigma_data)
 
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
-        loss = weight * loss
-
-        return loss
+        return (v_pred - v_star) ** 2
 
