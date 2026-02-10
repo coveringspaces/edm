@@ -115,7 +115,7 @@ class CFMLoss:
         x = alpha * y + s * self.sigma_data * eps
 
         # Net returns x0_hat.
-        x0_hat = net(x, t, labels, augment_labels=augment_labels)
+        x0_hat, logvar = net(x, t, labels, augment_labels=augment_labels, return_logvar=True)
 
         # Recover v_pred from x0_hat:
         # x0_hat = alpha*x - s*sigma_data*v  =>  v = (alpha*x - x0_hat)/(s*sigma_data)
@@ -125,5 +125,5 @@ class CFMLoss:
         # TrigFlow target velocity.
         v_star = alpha * eps - s * (y / self.sigma_data)
 
-        return (v_pred - v_star) ** 2
+        return (1/logvar.exp()) * (v_pred - v_star) ** 2 + logvar
 

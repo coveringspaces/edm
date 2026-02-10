@@ -14,6 +14,17 @@ from torch_utils import persistence
 from torch.nn.functional import silu
 
 #----------------------------------------------------------------------------
+# Normalize given tensor to unit magnitude with respect to the given
+# dimensions. Default = all dimensions except the first.
+
+def normalize(x, dim=None, eps=1e-4):
+    if dim is None:
+        dim = list(range(1, x.ndim))
+    norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=torch.float32)
+    norm = torch.add(eps, norm, alpha=np.sqrt(norm.numel() / x.numel()))
+    return x / norm.to(x.dtype)
+
+#----------------------------------------------------------------------------
 # Unified routine for initializing weights and biases.
 
 def weight_init(shape, mode, fan_in, fan_out):
@@ -218,6 +229,47 @@ class FourierEmbedding(torch.nn.Module):
         x = x.ger((2 * np.pi * self.freqs).to(x.dtype))
         x = torch.cat([x.cos(), x.sin()], dim=1)
         return x
+
+#----------------------------------------------------------------------------
+# Magnitude-preserving Fourier features (Equation 75).
+
+@persistence.persistent_class
+class MPFourier(torch.nn.Module):
+    def __init__(self, num_channels, bandwidth=1):
+        super().__init__()
+        self.register_buffer('freqs', 2 * np.pi * torch.randn(num_channels) * bandwidth)
+        self.register_buffer('phases', 2 * np.pi * torch.rand(num_channels))
+
+    def forward(self, x):
+        y = x.to(torch.float32)
+        y = y.ger(self.freqs.to(torch.float32))
+        y = y + self.phases.to(torch.float32)
+        y = y.cos() * np.sqrt(2)
+        return y.to(x.dtype)
+
+#----------------------------------------------------------------------------
+# Magnitude-preserving convolution or fully-connected layer (Equation 47)
+# with force weight normalization (Equation 66).
+
+@persistence.persistent_class
+class MPConv(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel):
+        super().__init__()
+        self.out_channels = out_channels
+        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
+
+    def forward(self, x, gain=1):
+        w = self.weight.to(torch.float32)
+        if self.training:
+            with torch.no_grad():
+                self.weight.copy_(normalize(w)) # forced weight normalization
+        w = normalize(w) # traditional weight normalization
+        w = w * (gain / np.sqrt(w[0].numel())) # magnitude-preserving scaling
+        w = w.to(x.dtype)
+        if w.ndim == 2:
+            return x @ w.t()
+        assert w.ndim == 4
+        return torch.nn.functional.conv2d(x, w, padding=(w.shape[-1]//2,))
 
 #----------------------------------------------------------------------------
 # Reimplementation of the DDPM++ and NCSN++ architectures from the paper
@@ -685,6 +737,7 @@ class CFMPrecond(torch.nn.Module):
         sigma_max       = float('inf'),     # Maximum supported noise level.
         sigma_data      = 0.5,              # Expected standard deviation of the training data.
         model_type      = 'DhariwalUNet',   # Class name of the underlying model.
+        logvar_channels = 128,              # Intermediate dimensionality for uncertainty estimation.
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):
         super().__init__()
@@ -696,8 +749,10 @@ class CFMPrecond(torch.nn.Module):
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
         self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=img_channels, label_dim=label_dim, **model_kwargs)
+        self.logvar_fourier = MPFourier(logvar_channels)
+        self.logvar_linear = MPConv(logvar_channels, 1, kernel=[])
 
-    def forward(self, x, t, class_labels=None, force_fp32=False, **model_kwargs):
+    def forward(self, x, t, class_labels=None, force_fp32=False, return_logvar=False, **model_kwargs):
         x = x.to(torch.float32)
         t = t.to(torch.float32).reshape(-1, 1, 1, 1)
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
@@ -715,6 +770,11 @@ class CFMPrecond(torch.nn.Module):
 
         # Convert v -> denoised estimate x0_hat.
         x0_hat = alpha * x - s * self.sigma_data * v
+
+        # Estimate uncertainty if requested.
+        if return_logvar:
+            logvar = self.logvar_linear(self.logvar_fourier(c_noise.flatten())).reshape(-1, 1, 1, 1)
+            return x0_hat, logvar # u(sigma) in Equation 21 in EDM2 paper
         return x0_hat
 
     def round_sigma(self, sigma):
