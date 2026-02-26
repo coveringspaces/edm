@@ -343,7 +343,17 @@ class KoopmanLoss:
             # labels & augment_labels treated as constants (no grads through them)
             return psi_net(x_in, t_in, class_labels=labels, augment_labels=augment_labels)  # (B,2k)
 
-        psi_hat, Lpsi_hat = self._jvp(f, (x, t), (xdot, tdot))  # both (B,2k)
+        def _jvp_f(x_in, t_in, xdot, tdot):
+            x_in = x_in.unsqueeze(0)
+            t_in = t_in.unsqueeze(0)
+            xdot = xdot.unsqueeze(0)
+            tdot = tdot.unsqueeze(0)
+
+            psi_hat, Lpsi_hat = self._jvp(f, (x_in, t_in), (xdot, tdot)
+                                          
+            return psi_hat.squeeze(0), Lpsi_hat.squeeze(0)
+
+        psi_hat, Lpsi_hat = torch.func.vmap(_jvp_f)(x, t, xdot, tdot)  # both (B,2k)
 
         # ------------------------------------------------------------
         # (D) Convert to complex (re/im) blocks: psi = psi_re + i psi_im
