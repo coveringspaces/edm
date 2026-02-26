@@ -350,9 +350,9 @@ class KoopmanLoss:
             _xdot = _xdot.unsqueeze(0)
             _tdot = _tdot.unsqueeze(0)
 
-            psi_hat, Lpsi_hat = self._jvp(f, (x_in, t_in), (xdot, tdot))
+            _psi_hat, _Lpsi_hat = self._jvp(f, (_x_in, _t_in), (_xdot, _tdot))
                                           
-            return psi_hat.squeeze(0), Lpsi_hat.squeeze(0)
+            return _psi_hat.squeeze(0), _Lpsi_hat.squeeze(0)
 
         _vmapped_jvp_f = vmap(_jvp_f)
 
