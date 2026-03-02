@@ -1,5 +1,6 @@
 # Outputs / data
 training-runs/
+training-runs-koopman/
 datasets/
 downloads/
 fid-refs/
