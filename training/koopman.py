@@ -152,7 +152,7 @@ class KoopmanPhases(nn.Module):
         phi0 = torch.zeros(k) if init_zero else 2 * torch.pi * torch.rand(k)
         self.phi = nn.Parameter(phi0)
 
-    def forward(self):
+    def forward(self, _dummy):
         # returns (cos φ, sin φ) each shape (k,)
         return torch.cos(self.phi), torch.sin(self.phi)
 
@@ -249,24 +249,30 @@ class KoopmanLoss:
         # ------------------------------------------------------------
         # (C) One JVP: (psi, Lpsi) where Lpsi = ∂t psi + ∇x psi · xdot
         # ------------------------------------------------------------
+        # Extract the raw module from DDP if necessary
+        # torch.func.jvp and DDP wrappers are incompatible
+        raw_psi_net = psi_net.module if hasattr(psi_net, 'module') else psi_net
+        
         def f(x_in, t_in):
             # labels & augment_labels treated as constants (no grads through them)
-            return psi_net(x_in, t_in, class_labels=labels, augment_labels=augment_labels)  # (B,2k)
+            return raw_psi_net(x_in, t_in, class_labels=labels, augment_labels=augment_labels)  # (B,2k)
 
-        def _jvp_f(_x_in, _t_in, _xdot, _tdot):
-            # All inputs are expected to be unbatched
-            _x_in = _x_in.unsqueeze(0)
-            _t_in = _t_in.unsqueeze(0)
-            _xdot = _xdot.unsqueeze(0)
-            _tdot = _tdot.unsqueeze(0)
+        # def _jvp_f(_x_in, _t_in, _xdot, _tdot):
+        #     # All inputs are expected to be unbatched
+        #     _x_in = _x_in.unsqueeze(0)
+        #     _t_in = _t_in.unsqueeze(0)
+        #     _xdot = _xdot.unsqueeze(0)
+        #     _tdot = _tdot.unsqueeze(0)
 
-            _psi_hat, _Lpsi_hat = self._jvp(f, (_x_in, _t_in), (_xdot, _tdot))
+        #     _psi_hat, _Lpsi_hat = self._jvp(f, (_x_in, _t_in), (_xdot, _tdot))
                                           
-            return _psi_hat.squeeze(0), _Lpsi_hat.squeeze(0)
+        #     return _psi_hat.squeeze(0), _Lpsi_hat.squeeze(0)
 
-        _vmapped_jvp_f = vmap(_jvp_f)
+        # _vmapped_jvp_f = vmap(_jvp_f, randomness='different') 
 
-        psi_hat, Lpsi_hat = _vmapped_jvp_f(x, t, xdot, tdot)  # both (B,2k)
+        # psi_hat, Lpsi_hat = _vmapped_jvp_f(x, t, xdot, tdot)  # both (B,2k)
+
+        psi_hat, Lpsi_hat = self._jvp(f, (x, t), (xdot, tdot))  # both (B,2k)
 
         # ------------------------------------------------------------
         # (D) Convert to complex (re/im) blocks: psi = psi_re + i psi_im
@@ -280,7 +286,7 @@ class KoopmanLoss:
         # (E) Term 1:  -2 Σ_i Re( e^{i φ_i} <psi_i, L psi_i> )
         # ------------------------------------------------------------
         ip_re, ip_im = complex_inner_batch(psi_re, psi_im, Lpsi_re, Lpsi_im)  # (k,) each
-        cos_phi, sin_phi = phase_net()  # (k,), (k,)
+        cos_phi, sin_phi = phase_net(t)  # (k,), (k,) (putting a dummy t in to use DDP correctly; phase_net ignores it)
 
         # e^{iφ}(ip_re + i ip_im) real-part:
         # Re( (cos + i sin)(ip_re + i ip_im) ) = cos*ip_re - sin*ip_im

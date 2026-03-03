@@ -157,6 +157,22 @@ def koopman_training_loop(
     ema_psi = copy.deepcopy(psi_net).eval().requires_grad_(False)
     ema_phase = copy.deepcopy(phase_net).eval().requires_grad_(False)
 
+    # 1. Ensure all parameters are synced, including unused ones
+    if dist.get_world_size() > 1:
+        dist.print0('Synchronizing initial parameters across ranks...')
+        for param in psi_net.parameters():
+            torch.distributed.broadcast(param.data, src=0)
+        for param in phase_net.parameters():
+            torch.distributed.broadcast(param.data, src=0)
+        
+        # 2. Sync EMA buffers to prevent save-time drift
+        for p_ema in ema_psi.parameters():
+            torch.distributed.broadcast(p_ema.data, src=0)
+        for p_ema in ema_phase.parameters():
+            torch.distributed.broadcast(p_ema.data, src=0)
+
+    dist.print0('Initialization complete. Starting training loop...')
+
     # Resume (Koopman stage) from training-state dump, if any.
     if resume_state_dump:
         dist.print0(f'Loading Koopman training state from "{resume_state_dump}"...')
@@ -257,11 +273,11 @@ def koopman_training_loop(
         if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
             # store EMA nets (recommended for inference)
             data = dict(
-                psi_ema=copy.deepcopy(ema_psi).eval().requires_grad_(False).cpu(),
-                phase_ema=copy.deepcopy(ema_phase).eval().requires_grad_(False).cpu(),
+                psi_ema=copy.deepcopy(ema_psi).eval().requires_grad_(False),
+                phase_ema=copy.deepcopy(ema_phase).eval().requires_grad_(False),
                 # Also store non-EMA if you want:
-                psi_net=copy.deepcopy(psi_net).eval().requires_grad_(False).cpu(),
-                phase_net=copy.deepcopy(phase_net).eval().requires_grad_(False).cpu(),
+                psi_net=copy.deepcopy(psi_net).eval().requires_grad_(False),
+                phase_net=copy.deepcopy(phase_net).eval().requires_grad_(False),
                 # record how we got the vector field:
                 cfm_resume_pkl=cfm_resume_pkl,
                 dataset_kwargs=dict(dataset_kwargs),
@@ -269,17 +285,18 @@ def koopman_training_loop(
                 phase_kwargs=dict(phase_kwargs),
                 koopman_loss_kwargs=dict(koopman_loss_kwargs),
             )
-            # DDP consistency checks on modules we saved.
-            misc.check_ddp_consistency(data['psi_ema'])
-            misc.check_ddp_consistency(data['psi_net'])
-            # phase nets are tiny but still modules.
-            misc.check_ddp_consistency(data['phase_ema'])
-            misc.check_ddp_consistency(data['phase_net'])
+            # Check + move to CPU (EDM style)
+            for k, v in list(data.items()):
+                if isinstance(v, torch.nn.Module):
+                    misc.check_ddp_consistency(v)   # must happen BEFORE .cpu()
+                    data[k] = v.cpu()
+                del v
 
             if dist.get_rank() == 0:
                 snap_path = os.path.join(run_dir, f'koopman-snapshot-{cur_nimg//1000:06d}.pkl')
                 with open(snap_path, 'wb') as f:
                     pickle.dump(data, f)
+
             del data
 
         # State dump (for resuming optimizer).

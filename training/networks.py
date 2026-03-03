@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch_utils import persistence
 from torch.nn.functional import silu
+import math
 
 #----------------------------------------------------------------------------
 # Normalize given tensor to unit magnitude with respect to the given
@@ -121,12 +122,37 @@ class GroupNorm(torch.nn.Module):
 # Performs all computation using FP32, but uses the original datatype for
 # inputs/outputs/gradients to conserve memory.
 
+# class AttentionOp(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, q, k):
+#         w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
+#         ctx.save_for_backward(q, k, w)
+#         return w
+
+#     @staticmethod
+#     def backward(ctx, dw):
+#         q, k, w = ctx.saved_tensors
+#         db = torch._softmax_backward_data(grad_output=dw.to(torch.float32), output=w.to(torch.float32), dim=2, input_dtype=torch.float32)
+#         dq = torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) / np.sqrt(k.shape[1])
+#         dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
+#         return dq, dk
+
+#----------------------------------------------------------------------------
+# reimplement so that it works for jvp
+# https://docs.pytorch.org/docs/stable/notes/extending.func.html
+
 class AttentionOp(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k):
+    def forward(q, k):
         w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
-        ctx.save_for_backward(q, k, w)
         return w
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        q, k = inputs
+        w = output
+        ctx.save_for_backward(q, k, w)
+        ctx.save_for_forward(q, k, w)
 
     @staticmethod
     def backward(ctx, dw):
@@ -135,6 +161,28 @@ class AttentionOp(torch.autograd.Function):
         dq = torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) / np.sqrt(k.shape[1])
         dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
         return dq, dk
+
+    @staticmethod
+    def jvp(ctx, dq, dk):
+        q, k, w = ctx.saved_tensors
+        if dq is None and dk is None:
+            return torch.zeros_like(w)
+
+        C = k.shape[1]
+        inv_sqrtC = 1.0 / math.sqrt(C)
+
+        qf = q.to(torch.float32)
+        kf = k.to(torch.float32)
+        wf = w.to(torch.float32)
+
+        dS = 0.0
+        if dq is not None:
+            dS = dS + torch.einsum('ncq,nck->nqk', dq.to(torch.float32), kf) * inv_sqrtC
+        if dk is not None:
+            dS = dS + torch.einsum('ncq,nck->nqk', qf, dk.to(torch.float32)) * inv_sqrtC
+
+        dw = wf * (dS - (wf * dS).sum(dim=2, keepdim=True))
+        return dw.to(w.dtype)
 
 #----------------------------------------------------------------------------
 # Unified U-Net block with optional up/downsampling and self-attention.
