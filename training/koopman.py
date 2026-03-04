@@ -244,6 +244,12 @@ class KoopmanLoss:
         with torch.no_grad():
             xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, sigma_data=self.sigma_data)
 
+        # print("t min/max", t.min().item(), t.max().item())
+        # print("sin(t) min", torch.sin(t).min().item())
+        # print("xdot finite?", torch.isfinite(xdot).all().item())
+        # print("xdot absmax", xdot.abs().max().item())
+        # print("xdot rms", xdot.square().mean().sqrt().item())
+
         tdot = torch.ones_like(t)  # dt/ds = 1 in the time-augmented system
 
         # ------------------------------------------------------------
@@ -252,10 +258,21 @@ class KoopmanLoss:
         # Extract the raw module from DDP if necessary
         # torch.func.jvp and DDP wrappers are incompatible
         raw_psi_net = psi_net.module if hasattr(psi_net, 'module') else psi_net
+
+        # # Check inputs to the whole system
+        # print(f"Input Check - x max: {x.abs().max():.2e}, t max: {t.abs().max():.2e}")
+        # print(f"Tangent Check - xdot max: {xdot.abs().max():.2e}, tdot max: {tdot.abs().max():.2e}")
+
+        # # Check augmentation labels specifically
+        # if augment_labels is not None:
+        #     print(f"Augment Check - labels max: {augment_labels.abs().max():.2e}")
         
         def f(x_in, t_in):
             # labels & augment_labels treated as constants (no grads through them)
-            return raw_psi_net(x_in, t_in, class_labels=labels, augment_labels=augment_labels)  # (B,2k)
+            out = raw_psi_net(x_in, t_in, class_labels=labels, augment_labels=augment_labels, force_fp32=True)  # (B,2k)
+            if torch.isnan(out).any():
+                print("!!! raw_psi_net produced NaN in forward pass")
+            return out
 
         # def _jvp_f(_x_in, _t_in, _xdot, _tdot):
         #     # All inputs are expected to be unbatched
@@ -274,11 +291,43 @@ class KoopmanLoss:
 
         psi_hat, Lpsi_hat = self._jvp(f, (x, t), (xdot, tdot))  # both (B,2k)
 
+        if torch.isnan(psi_hat).any() or torch.isnan(Lpsi_hat).any():
+            print("!!! NaN in psi_hat or Lpsi_hat")
+
+        print("psi_hat  mean/std/max:",
+            psi_hat.mean().item(),
+            psi_hat.std().item(),
+            psi_hat.abs().max().item())
+
+        print("Lpsi_hat mean/std/max:",
+            Lpsi_hat.mean().item(),
+            Lpsi_hat.std().item(),
+            Lpsi_hat.abs().max().item())
+
+        # # 1. Check Teacher (CFM) output
+        # with torch.no_grad():
+        #     xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, sigma_data=self.sigma_data)
+        # if torch.isnan(xdot).any():
+        #     print(f"!!! NAN detected in Teacher xdot at t={t.mean().item()}")
+        #     # This usually means t is too small or sigma_data is mismatched
+
+        # # 2. Check Koopman (Psi) output
+        # psi_hat, Lpsi_hat = self._jvp(f, (x, t), (xdot, tdot))
+        # if torch.isnan(psi_hat).any() or torch.isnan(Lpsi_hat).any():
+        #     print("!!! NAN detected in Koopman JVP (psi_hat or Lpsi_hat)")
+        #     # This often means the Linear head or AttentionOp is exploding
+
         # ------------------------------------------------------------
         # (D) Convert to complex (re/im) blocks: psi = psi_re + i psi_im
         # ------------------------------------------------------------
         psi_re, psi_im     = split_reim(psi_hat)     # (B,k), (B,k)
         Lpsi_re, Lpsi_im   = split_reim(Lpsi_hat)    # (B,k), (B,k)
+
+        print("psi magnitude mean:",
+            (psi_re**2 + psi_im**2).mean().sqrt().item())
+
+        print("Lpsi magnitude mean:",
+            (Lpsi_re**2 + Lpsi_im**2).mean().sqrt().item())   
 
         B, k = psi_re.shape
 
@@ -298,6 +347,12 @@ class KoopmanLoss:
         # ------------------------------------------------------------
         G_re, G_im = complex_gram(psi_re, psi_im)          # (k,k), (k,k)
         absG2 = G_re**2 + G_im**2                          # |G_ij|^2
+
+        print("Gram diag mean:",
+            G_re.diag().mean().item())
+
+        print("Gram abs max:",
+            absG2.sqrt().max().item())    
 
         # cos(φ_i - φ_j) = cosφ_i cosφ_j + sinφ_i sinφ_j
         cos_dphi = cos_phi[:, None] * cos_phi[None, :] + sin_phi[:, None] * sin_phi[None, :]

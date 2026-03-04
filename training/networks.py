@@ -142,9 +142,25 @@ class GroupNorm(torch.nn.Module):
 # https://docs.pytorch.org/docs/stable/notes/extending.func.html
 
 class AttentionOp(torch.autograd.Function):
+    # @staticmethod
+    # def forward(q, k):
+    #     w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
+    #     return w
+
     @staticmethod
     def forward(q, k):
-        w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
+        # Calculate raw scores (S)
+        C = k.shape[1]
+        S = torch.einsum('ncq,nck->nqk', q.to(torch.float32), k.to(torch.float32)) / np.sqrt(C)
+        
+        # # --- PRINT CHECK ---
+        # if torch.isnan(S).any():
+        #     print(f"!!! NAN in raw attention scores (S) before softmax. Q max: {q.abs().max()}, K max: {k.abs().max()}")
+        # if S.abs().max() > 50:
+        #     print(f"!!! Extremely high attention scores: {S.abs().max().item():.2e}. This will likely break JVP.")
+        # -------------------
+
+        w = S.softmax(dim=2).to(q.dtype)
         return w
 
     @staticmethod
@@ -162,11 +178,39 @@ class AttentionOp(torch.autograd.Function):
         dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
         return dq, dk
 
+    # @staticmethod
+    # def jvp(ctx, dq, dk):
+    #     q, k, w = ctx.saved_tensors
+    #     if dq is None and dk is None:
+    #         return torch.zeros_like(w)
+
+    #     C = k.shape[1]
+    #     inv_sqrtC = 1.0 / math.sqrt(C)
+
+    #     qf = q.to(torch.float32)
+    #     kf = k.to(torch.float32)
+    #     wf = w.to(torch.float32)
+
+    #     dS = 0.0
+    #     if dq is not None:
+    #         dS = dS + torch.einsum('ncq,nck->nqk', dq.to(torch.float32), kf) * inv_sqrtC
+    #     if dk is not None:
+    #         dS = dS + torch.einsum('ncq,nck->nqk', qf, dk.to(torch.float32)) * inv_sqrtC
+
+    #     dw = wf * (dS - (wf * dS).sum(dim=2, keepdim=True))
+    #     return dw.to(w.dtype)
+
     @staticmethod
     def jvp(ctx, dq, dk):
         q, k, w = ctx.saved_tensors
-        if dq is None and dk is None:
-            return torch.zeros_like(w)
+
+        # if dq is not None and torch.isnan(dq).any():
+        #     print("!!! dq has NaNs", "dq absmax:", dq.abs().max().item())
+        # if dk is not None and torch.isnan(dk).any():
+        #     print("!!! dk has NaNs", "dk absmax:", dk.abs().max().item())
+
+        # if torch.isnan(q).any() or torch.isnan(k).any() or torch.isnan(w).any():
+        #     print("!!! saved q/k/w already have NaNs")
 
         C = k.shape[1]
         inv_sqrtC = 1.0 / math.sqrt(C)
@@ -181,7 +225,18 @@ class AttentionOp(torch.autograd.Function):
         if dk is not None:
             dS = dS + torch.einsum('ncq,nck->nqk', qf, dk.to(torch.float32)) * inv_sqrtC
 
+        # --- PRINT CHECK ---
+        if torch.isnan(dS).any():
+            print("!!! NAN in dS (tangent scores)")
+        # -------------------
+
+        # This is the "Softmax JVP" formula
+        # If wf is very close to 0 or 1, and dS is large, this subtraction is unstable
         dw = wf * (dS - (wf * dS).sum(dim=2, keepdim=True))
+        
+        # if torch.isnan(dw).any():
+        #      print(f"!!! NAN in dw. wf max: {wf.max().item():.2e}, dS max: {dS.abs().max().item():.2e}")
+             
         return dw.to(w.dtype)
 
 #----------------------------------------------------------------------------
@@ -239,6 +294,8 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
+            if torch.isnan(q).any() or torch.isnan(k).any() or torch.isnan(v).any():
+                print("FORWARD has NaN before attention")
             w = AttentionOp.apply(q, k)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)

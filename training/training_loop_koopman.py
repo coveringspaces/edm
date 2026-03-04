@@ -124,6 +124,14 @@ def koopman_training_loop(
     psi_net = dnnlib.util.construct_class_by_name(**psi_network_kwargs, **interface_kwargs)
     psi_net.train().requires_grad_(True).to(device)
 
+    # # Manual weight scaling to prevent JVP explosion
+    # with torch.no_grad():
+    #     for name, param in psi_net.named_parameters():
+    #         # Check for standard names in Dhariwal/ADM-style blocks
+    #         if any(x in name for x in ['qkv', 'proj', 'head', 'out']):
+    #             param.data.mul_(0.01)
+    #             dist.print0(f'Scaled down: {name}')
+
     phase_net = dnnlib.util.construct_class_by_name(**phase_kwargs)  # expects k inside kwargs or class default
     phase_net.train().requires_grad_(True).to(device)
 
