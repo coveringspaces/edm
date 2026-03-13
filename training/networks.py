@@ -294,9 +294,7 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            if torch.isnan(q).any() or torch.isnan(k).any() or torch.isnan(v).any():
-                print("FORWARD has NaN before attention")
-            w = AttentionOp.apply(q, k)
+            w = torch.softmax(torch.einsum('ncq,nck->nqk', q.float(), k.float()) / math.sqrt(k.shape[1]), dim=2).to(q.dtype)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale

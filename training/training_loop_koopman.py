@@ -40,6 +40,7 @@ def koopman_training_loop(
     ema_rampup_ratio    = 0.05,
 
     loss_scaling        = 1,
+    grad_clip_norm      = 10.0,     # max gradient norm for clipping
     kimg_per_tick       = 50,
     snapshot_ticks      = 50,
     state_dump_ticks    = 500,
@@ -48,11 +49,17 @@ def koopman_training_loop(
     resume_kimg         = 0,
     cudnn_benchmark     = True,
     device              = torch.device('cuda'),
+    wandb_project       = None,     # W&B project name, None = disabled
+    wandb_name          = None,     # W&B run name (optional)
 ):
     # ------------------------------------------------------------------------
     # Init.
     # ------------------------------------------------------------------------
     start_time = time.time()
+
+    if wandb_project is not None and dist.get_rank() == 0:
+        import wandb
+        wandb.init(project=wandb_project, name=wandb_name, resume='allow')
     np.random.seed((seed * dist.get_world_size() + dist.get_rank()) % (1 << 31))
     torch.manual_seed(np.random.randint(1 << 31))
 
@@ -158,9 +165,8 @@ def koopman_training_loop(
     train_params = list(psi_net.parameters()) + list(phase_net.parameters())
     optimizer = dnnlib.util.construct_class_by_name(params=train_params, **optimizer_kwargs)
 
-    ddp_psi = torch.nn.parallel.DistributedDataParallel(psi_net, device_ids=[device], broadcast_buffers=False)
-    # phase_net is tiny; DDP is optional. Keeping it DDP avoids rank drift.
-    ddp_phase = torch.nn.parallel.DistributedDataParallel(phase_net, device_ids=[device], broadcast_buffers=False)
+    # No DDP wrappers: torch.func.jvp is incompatible with DDP.
+    # Gradient synchronisation is done manually via all_reduce after backward.
 
     ema_psi = copy.deepcopy(psi_net).eval().requires_grad_(False)
     ema_phase = copy.deepcopy(phase_net).eval().requires_grad_(False)
@@ -209,24 +215,29 @@ def koopman_training_loop(
         optimizer.zero_grad(set_to_none=True)
 
         for round_idx in range(num_accumulation_rounds):
-            with misc.ddp_sync(ddp_psi, (round_idx == num_accumulation_rounds - 1)):
-                with misc.ddp_sync(ddp_phase, (round_idx == num_accumulation_rounds - 1)):
-                    images, labels = next(dataset_iterator)
-                    images = images.to(device).to(torch.float32) / 127.5 - 1
-                    labels = labels.to(device)
+            images, labels = next(dataset_iterator)
+            images = images.to(device).to(torch.float32) / 127.5 - 1
+            labels = labels.to(device)
 
-                    # IMPORTANT: CFM is frozen; KoopmanLoss already uses no_grad() around xdot.
-                    loss = koop_loss(
-                        psi_net=ddp_psi,
-                        phase_net=ddp_phase,
-                        cfm_net=cfm_net,
-                        images=images,
-                        labels=labels,
-                        augment_pipe=augment_pipe,
-                    )
+            # IMPORTANT: CFM is frozen; KoopmanLoss already uses no_grad() around xdot.
+            loss = koop_loss(
+                psi_net=psi_net,
+                phase_net=phase_net,
+                cfm_net=cfm_net,
+                images=images,
+                labels=labels,
+                augment_pipe=augment_pipe,
+            )
 
-                    training_stats.report('Loss/koopman', loss)
-                    loss.mul(loss_scaling / batch_gpu_total).backward()
+            training_stats.report('Loss/koopman', loss)
+            loss.mul(loss_scaling / batch_gpu_total).backward()
+
+        # Manually all-reduce gradients across GPUs (replaces DDP all-reduce hooks).
+        if dist.get_world_size() > 1:
+            for param in train_params:
+                if param.grad is not None:
+                    torch.distributed.all_reduce(param.grad)
+                    param.grad.div_(dist.get_world_size())
 
         # LR ramp.
         for g in optimizer.param_groups:
@@ -237,6 +248,16 @@ def koopman_training_loop(
         for p in train_params:
             if p.grad is not None:
                 torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
+
+        # Compute and report grad norm before clipping.
+        grad_norm = torch.sqrt(sum(p.grad.norm()**2 for p in train_params if p.grad is not None))
+        training_stats.report('Grads/grad_norm', grad_norm)
+
+        # Gradient clipping: xdot varies ~1000x across the noise schedule, causing
+        # occasional huge gradient spikes that overshoot the optimum.
+        torch.nn.utils.clip_grad_norm_(train_params, max_norm=grad_clip_norm)
+        clipped_norm = torch.sqrt(sum(p.grad.norm()**2 for p in train_params if p.grad is not None))
+        training_stats.report('Grads/grad_norm_clipped', clipped_norm)
 
         optimizer.step()
 
@@ -293,10 +314,11 @@ def koopman_training_loop(
                 phase_kwargs=dict(phase_kwargs),
                 koopman_loss_kwargs=dict(koopman_loss_kwargs),
             )
-            # Check + move to CPU (EDM style)
+            # Check parameter consistency across ranks, then move to CPU for pickling.
             for k, v in list(data.items()):
                 if isinstance(v, torch.nn.Module):
-                    misc.check_ddp_consistency(v)   # must happen BEFORE .cpu()
+                    if dist.get_world_size() > 1:
+                        misc.check_ddp_consistency(v)
                     data[k] = v.cpu()
                 del v
 
@@ -325,6 +347,14 @@ def koopman_training_loop(
             stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
             stats_jsonl.flush()
 
+            if wandb_project is not None:
+                import wandb
+                wandb.log(
+                    {name: training_stats.default_collector.mean(name)
+                     for name in training_stats.default_collector.names()},
+                    step=cur_nimg,
+                )
+
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
         cur_tick += 1
@@ -334,6 +364,10 @@ def koopman_training_loop(
 
         if done:
             break
+
+    if wandb_project is not None and dist.get_rank() == 0:
+        import wandb
+        wandb.finish()
 
     dist.print0()
     dist.print0('Exiting Koopman training...')

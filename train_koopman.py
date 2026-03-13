@@ -50,7 +50,7 @@ def parse_int_list(s):
 @click.option('--duration',     help='Training duration', metavar='MIMG',                  type=click.FloatRange(min=0, min_open=True), default=50, show_default=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                    type=click.IntRange(min=1), default=512, show_default=True)
 @click.option('--batch-gpu',    help='Limit batch size per GPU', metavar='INT',            type=click.IntRange(min=1))
-@click.option('--lr',           help='Learning rate', metavar='FLOAT',                     type=click.FloatRange(min=0, min_open=True), default=2e-4, show_default=True)
+@click.option('--lr',           help='Learning rate', metavar='FLOAT',                     type=click.FloatRange(min=0, min_open=True), default=1e-5, show_default=True)
 @click.option('--lr-rampup',    help='LR ramp-up', metavar='MIMG',                         type=click.FloatRange(min=0), default=1.0, show_default=True)
 @click.option('--ema',          help='EMA half-life', metavar='MIMG',                      type=click.FloatRange(min=0), default=0.5, show_default=True)
 
@@ -58,6 +58,8 @@ def parse_int_list(s):
 @click.option('--cbase',        help='Model channels (ADM base)', metavar='INT',           type=int, default=192, show_default=True)
 @click.option('--cres',         help='Channel mult list', metavar='LIST',                  type=parse_int_list, default='1,2,3,4', show_default=True)
 @click.option('--dropout',      help='Dropout probability', metavar='FLOAT',               type=click.FloatRange(min=0, max=1), default=0.10, show_default=True)
+@click.option('--operator-scale', help='Scale of CFM vector field (divides term1)', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=100.0, show_default=True)
+@click.option('--grad-clip',    help='Max gradient norm for clipping', metavar='FLOAT',            type=click.FloatRange(min=0, min_open=True), default=100.0, show_default=True)
 
 # Augment (optional; same as EDM train.py pattern).
 @click.option('--augment',      help='Augment probability', metavar='FLOAT',               type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
@@ -73,6 +75,10 @@ def parse_int_list(s):
 
 # Resume.
 @click.option('--resume',       help='Resume from previous koopman-training-state-*.pt', metavar='PT', type=str)
+
+# W&B.
+@click.option('--wandb-project', help='Weights & Biases project name', metavar='STR', type=str, default=None)
+@click.option('--wandb-name',    help='Weights & Biases run name', metavar='STR', type=str, default=None)
 
 # Seed.
 @click.option('--seed',         help='Random seed [default: random]', metavar='INT',       type=int)
@@ -151,14 +157,13 @@ def main(**kwargs):
     # Koopman loss.
     c.koopman_loss_kwargs = dnnlib.EasyDict(
         class_name='training.koopman.KoopmanLoss',
-        # You can expose these later if you want:
         P_mean=-1.2,
         P_std=1.2,
         sigma_data=0.5,
         sigma_min=1e-3,
         sigma_max=80,
         t_epsilon=1e-4,
-        anti_collapse=1e-3,
+        operator_scale=opts.operator_scale,
     )
 
     # Optimizer.
@@ -174,6 +179,7 @@ def main(**kwargs):
         # c.cfm_network_kwargs.augment_dim = 9  # teacher net also expects augment labels if used
 
     # Training options.
+    c.grad_clip_norm = opts.grad_clip
     c.total_kimg = max(int(opts.duration * 1000), 1)
     c.lr_rampup_kimg = int(opts.lr_rampup * 1000)
     c.ema_halflife_kimg = int(opts.ema * 1000)
@@ -182,6 +188,8 @@ def main(**kwargs):
     c.kimg_per_tick = opts.tick
     c.snapshot_ticks = opts.snap
     c.state_dump_ticks = opts.dump
+    c.wandb_project = opts.wandb_project
+    c.wandb_name = opts.wandb_name
 
     # Seed.
     if opts.seed is not None:

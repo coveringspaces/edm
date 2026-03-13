@@ -3,6 +3,7 @@ training-runs/
 training-runs-koopman/
 datasets/
 downloads/
+scripts/
 fid-refs/
 cfm-samples/
 *.png

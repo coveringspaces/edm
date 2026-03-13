@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.func import jvp, vmap
 from torch_utils import persistence
+from torch_utils import training_stats
 from torch.nn.functional import silu
 
 from training.networks import DhariwalUNet
@@ -56,7 +57,7 @@ class DhariwalEncoderOnly(nn.Module):
 
         # --- encoder only ---
         for block in self.enc.values():
-            x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+            x = block(x, emb) if hasattr(block, 'emb_channels') else block(x)
 
         return x  # (B, Cb, Hb, Wb)
 
@@ -112,6 +113,11 @@ class KoopmanEigenNet(nn.Module):
             nn.SiLU(),
             nn.Linear(bottleneck_ch, 2*k),
         )
+        # Override default (Kaiming) init on the output projection so ψ starts at O(1) scale.
+        # Default std ≈ sqrt(2/bottleneck_ch) ≈ 0.05 — too small for a loss that is
+        # quadratic/quartic in ψ, causing gradients to vanish near ψ=0.
+        nn.init.normal_(self.head[-1].weight, std=1.0)
+        nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, x, t, class_labels=None, force_fp32=False, augment_labels=None):
         x = x.to(torch.float32)
@@ -203,14 +209,14 @@ class KoopmanLoss:
     def __init__(self,
                  P_mean=-1.2, P_std=1.2, sigma_data=0.5,
                  sigma_min=1e-3, sigma_max=80, t_epsilon=1e-4,
-                 anti_collapse=1e-3):
+                 operator_scale=100.0):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.t_epsilon = t_epsilon
-        self.anti_collapse = anti_collapse
+        self.operator_scale = operator_scale
 
         # torch.func.jvp exists in torch>=2.0
         try:
@@ -255,9 +261,7 @@ class KoopmanLoss:
         # ------------------------------------------------------------
         # (C) One JVP: (psi, Lpsi) where Lpsi = ∂t psi + ∇x psi · xdot
         # ------------------------------------------------------------
-        # Extract the raw module from DDP if necessary
-        # torch.func.jvp and DDP wrappers are incompatible
-        raw_psi_net = psi_net.module if hasattr(psi_net, 'module') else psi_net
+        raw_psi_net = psi_net
 
         # # Check inputs to the whole system
         # print(f"Input Check - x max: {x.abs().max():.2e}, t max: {t.abs().max():.2e}")
@@ -294,53 +298,28 @@ class KoopmanLoss:
         if torch.isnan(psi_hat).any() or torch.isnan(Lpsi_hat).any():
             print("!!! NaN in psi_hat or Lpsi_hat")
 
-        print("psi_hat  mean/std/max:",
-            psi_hat.mean().item(),
-            psi_hat.std().item(),
-            psi_hat.abs().max().item())
-
-        print("Lpsi_hat mean/std/max:",
-            Lpsi_hat.mean().item(),
-            Lpsi_hat.std().item(),
-            Lpsi_hat.abs().max().item())
-
-        # # 1. Check Teacher (CFM) output
-        # with torch.no_grad():
-        #     xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, sigma_data=self.sigma_data)
-        # if torch.isnan(xdot).any():
-        #     print(f"!!! NAN detected in Teacher xdot at t={t.mean().item()}")
-        #     # This usually means t is too small or sigma_data is mismatched
-
-        # # 2. Check Koopman (Psi) output
-        # psi_hat, Lpsi_hat = self._jvp(f, (x, t), (xdot, tdot))
-        # if torch.isnan(psi_hat).any() or torch.isnan(Lpsi_hat).any():
-        #     print("!!! NAN detected in Koopman JVP (psi_hat or Lpsi_hat)")
-        #     # This often means the Linear head or AttentionOp is exploding
-
         # ------------------------------------------------------------
         # (D) Convert to complex (re/im) blocks: psi = psi_re + i psi_im
         # ------------------------------------------------------------
         psi_re, psi_im     = split_reim(psi_hat)     # (B,k), (B,k)
         Lpsi_re, Lpsi_im   = split_reim(Lpsi_hat)    # (B,k), (B,k)
 
-        print("psi magnitude mean:",
-            (psi_re**2 + psi_im**2).mean().sqrt().item())
-
-        print("Lpsi magnitude mean:",
-            (Lpsi_re**2 + Lpsi_im**2).mean().sqrt().item())   
-
         B, k = psi_re.shape
 
+        training_stats.report('Loss/psi_rms', (psi_re**2 + psi_im**2).mean().sqrt())
+
         # ------------------------------------------------------------
-        # (E) Term 1:  -2 Σ_i Re( e^{i φ_i} <psi_i, L psi_i> )
+        # (E) Term 1:  -2 Σ_i Re( e^{i φ_i} <psi_i, L psi_i> ) / operator_scale
         # ------------------------------------------------------------
         ip_re, ip_im = complex_inner_batch(psi_re, psi_im, Lpsi_re, Lpsi_im)  # (k,) each
-        cos_phi, sin_phi = phase_net(t)  # (k,), (k,) (putting a dummy t in to use DDP correctly; phase_net ignores it)
+        cos_phi, sin_phi = phase_net(t)  # (k,), (k,); phase_net ignores t, the arg is a no-op placeholder
 
         # e^{iφ}(ip_re + i ip_im) real-part:
         # Re( (cos + i sin)(ip_re + i ip_im) ) = cos*ip_re - sin*ip_im
         real_sum = cos_phi * ip_re - sin_phi * ip_im    # (k,)
-        term1 = -2.0 * real_sum.sum()
+        # Divide by operator_scale (≈ magnitude of Lψ) so term1 ~ O(‖ψ‖²),
+        # matching term2 ~ O(‖ψ‖⁴) at the scale where eigenfunctions are O(1).
+        term1 = -2.0 * real_sum.mean() / self.operator_scale
 
         # ------------------------------------------------------------
         # (F) Term 2: Σ_{i,j} cos(φ_i - φ_j) |<psi_i,psi_j>|^2
@@ -348,18 +327,14 @@ class KoopmanLoss:
         G_re, G_im = complex_gram(psi_re, psi_im)          # (k,k), (k,k)
         absG2 = G_re**2 + G_im**2                          # |G_ij|^2
 
-        print("Gram diag mean:",
-            G_re.diag().mean().item())
-
-        print("Gram abs max:",
-            absG2.sqrt().max().item())    
-
         # cos(φ_i - φ_j) = cosφ_i cosφ_j + sinφ_i sinφ_j
         cos_dphi = cos_phi[:, None] * cos_phi[None, :] + sin_phi[:, None] * sin_phi[None, :]
-        term2 = (cos_dphi * absG2).sum()
+        term2 = (cos_dphi * absG2).mean()
+
+        training_stats.report('Loss/term1', term1)
+        training_stats.report('Loss/term2', term2)
 
         loss = term1 + term2
-
         return loss
 
 
