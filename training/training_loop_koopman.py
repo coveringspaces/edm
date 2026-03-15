@@ -349,11 +349,13 @@ def koopman_training_loop(
 
             if wandb_project is not None:
                 import wandb
-                wandb.log(
-                    {name: training_stats.default_collector.mean(name)
-                     for name in training_stats.default_collector.names()},
-                    step=cur_nimg,
-                )
+                log_dict = {name: training_stats.default_collector.mean(name)
+                            for name in training_stats.default_collector.names()}
+                if hasattr(koop_loss, '_last_lam_mag'):
+                    log_dict['Eigenvalues/lam_mag_hist'] = wandb.Histogram(
+                        koop_loss._last_lam_mag.cpu().numpy()
+                    )
+                wandb.log(log_dict, step=cur_nimg)
 
         dist.update_progress(cur_nimg // 1000, total_kimg)
 

@@ -200,6 +200,133 @@ def complex_gram(psi_re, psi_im):
     G_im = (-psi_im.T @ psi_re + psi_re.T @ psi_im) / B
     return G_re, G_im
 
+class NeuralSVDFunction(torch.autograd.Function):
+    """
+    Custom autograd function mirroring the official Neural SVD backward.
+
+    Inputs
+    ------
+    psi_A_re, psi_A_im   : (B/2, k)  active batch — receives gradient
+    Lpsi_A_re, Lpsi_A_im : (B/2, k)  Koopman operator on ψ_A (from JVP)
+    psi_B_re, psi_B_im   : (B/2, k)  target batch — functionally detached
+                                       via None returns
+    cos_phi, sin_phi      : (k,)      learned eigenvalue phases
+    operator_scale        : float     alignment-term normalisation
+
+    Output
+    ------
+    scalar loss = (term1 + term2) / k
+    """
+
+    @staticmethod
+    def forward(ctx, psi_A_re, psi_A_im, Lpsi_A_re, Lpsi_A_im,
+                psi_B_re, psi_B_im, cos_phi, sin_phi, operator_scale, metric_weight):
+        B_half, k = psi_A_re.shape
+        dev = psi_A_re.device
+
+        # ── Self-Gram of active batch A
+        G_A_re = (psi_A_re.T @ psi_A_re + psi_A_im.T @ psi_A_im) / B_half   # (k,k)
+        G_A_im = (-psi_A_im.T @ psi_A_re + psi_A_re.T @ psi_A_im) / B_half  # (k,k)
+
+        # ── Self-Gram of target batch B  (treated as a fixed scalar matrix in bwd)
+        G_B_re = (psi_B_re.T @ psi_B_re + psi_B_im.T @ psi_B_im) / B_half   # (k,k)
+        G_B_im = (-psi_B_im.T @ psi_B_re + psi_B_re.T @ psi_B_im) / B_half  # (k,k)
+
+        # ── Sequential nesting mask × phase weight
+        # matrix_mask[l,m] = triu[l,m] · cos(φ_l−φ_m)  — used in bwd einsum
+        triu        = torch.triu(torch.ones(k, k, device=dev))
+        cos_dphi    = (cos_phi[:, None] * cos_phi[None, :]
+                       + sin_phi[:, None] * sin_phi[None, :])                 # (k,k)
+        matrix_mask = triu * cos_dphi                                         # (k,k)
+
+        # ── Term 2: metric_weight · Σ_{l≤m} cos(φ_l−φ_m) · Re(conj(G_B[l,m]) · G_A[l,m])
+        # D[l,m] = G_B_re[l,m]·G_A_re[l,m] + G_B_im[l,m]·G_A_im[l,m]
+        D     = G_B_re * G_A_re + G_B_im * G_A_im                             # (k,k)
+        triu_D = triu * D                                                      # (k,k) for phase bwd
+        term2 = metric_weight * (matrix_mask * D).sum()
+
+        # ── Per-eigenfunction inner products ⟨ψ_A[:,m], Lψ_A[:,m]⟩
+        ip_re = (psi_A_re * Lpsi_A_re + psi_A_im * Lpsi_A_im).sum(0) / B_half  # (k,)
+        ip_im = (-psi_A_im * Lpsi_A_re + psi_A_re * Lpsi_A_im).sum(0) / B_half # (k,)
+
+        # ── Term 1: −2/scale · Σ_m Re(e^{iφ_m} · ⟨ψ_A_m, Lψ_A_m⟩)
+        term1 = -2.0 * (cos_phi * ip_re - sin_phi * ip_im).sum() / operator_scale
+
+        loss = (term1 + term2) / k
+
+        ctx.save_for_backward(
+            psi_A_re, psi_A_im, Lpsi_A_re, Lpsi_A_im,
+            cos_phi, sin_phi,
+            G_B_re, G_B_im, matrix_mask,
+            triu_D,
+            ip_re, ip_im,
+        )
+        ctx.operator_scale = operator_scale
+        ctx.metric_weight = metric_weight
+        ctx.B_half = B_half
+        ctx.k = k
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (psi_A_re, psi_A_im, Lpsi_A_re, Lpsi_A_im,
+         cos_phi, sin_phi,
+         G_B_re, G_B_im, matrix_mask,
+         triu_D,
+         ip_re, ip_im) = ctx.saved_tensors
+        scale         = ctx.operator_scale
+        metric_weight = ctx.metric_weight
+        B_half = ctx.B_half
+        k      = ctx.k
+        g = grad_output / k
+
+        fac2 = g * 2.0 * metric_weight / B_half
+        grad_psi_A_re = fac2 * (
+            torch.einsum('lm,lm,bl->bm', matrix_mask, G_B_re, psi_A_re)
+          - torch.einsum('lm,lm,bl->bm', matrix_mask, G_B_im, psi_A_im)
+        )
+        grad_psi_A_im = fac2 * (
+            torch.einsum('lm,lm,bl->bm', matrix_mask, G_B_re, psi_A_im)
+          + torch.einsum('lm,lm,bl->bm', matrix_mask, G_B_im, psi_A_re)
+        )
+
+        # ── Operator gradient: Term 1
+        # ∂term1/∂ψ_A_re[b,m] = (−2/(scale·B)) · (cos_φ_m·Lψ_A_re[b,m] − sin_φ_m·Lψ_A_im[b,m])
+        fac1 = g * (-2.0) / (scale * B_half)
+        grad_psi_A_re = grad_psi_A_re + fac1 * (cos_phi * Lpsi_A_re - sin_phi * Lpsi_A_im)
+        grad_psi_A_im = grad_psi_A_im + fac1 * (cos_phi * Lpsi_A_im + sin_phi * Lpsi_A_re)
+
+        grad_Lpsi_A_re = fac1 * (cos_phi * psi_A_re + sin_phi * psi_A_im)
+        grad_Lpsi_A_im = fac1 * (cos_phi * psi_A_im - sin_phi * psi_A_re)
+
+        # ── Phase gradients from Term 1
+        # ∂term1/∂cos_φ_m = −2/scale · ip_re[m]
+        grad_cos_phi = g * (-2.0 / scale) * ip_re
+        grad_sin_phi = g * (2.0 / scale) * ip_im
+
+        # ── Phase gradients from Term 2
+        # term2 = metric_weight · Σ_{l≤m} cos_dphi[l,m] · D[l,m]
+        # cos_dphi[l,m] = cos_φ_l·cos_φ_m + sin_φ_l·sin_φ_m
+        # ∂term2/∂cos_φ_m:
+        #   column (j=m, l≤m): Σ_{l≤m} cos_φ_l·D[l,m]  = (triu_D).T[:,m] · cos_phi
+        #   row    (l=m, j≥m): Σ_{j≥m} cos_φ_j·D[m,j]  = (triu_D)[m,:]   · cos_phi
+        # Diagonal (l=m=j) appears once in each sum → net 2·cos_φ_m·D[m,m] 
+        grad_cos_phi = grad_cos_phi + g * metric_weight * (triu_D.T @ cos_phi + triu_D @ cos_phi)
+        grad_sin_phi = grad_sin_phi + g * metric_weight * (triu_D.T @ sin_phi + triu_D @ sin_phi)
+
+        return (
+            grad_psi_A_re,   # psi_A_re — active, receives gradient
+            grad_psi_A_im,   # psi_A_im — active, receives gradient
+            grad_Lpsi_A_re,  # Lpsi_A_re — flows back through JVP
+            grad_Lpsi_A_im,  # Lpsi_A_im — flows back through JVP
+            None,            # psi_B_re — functionally detached 
+            None,            # psi_B_im — functionally detached
+            grad_cos_phi,    # cos_phi — learned phase
+            grad_sin_phi,    # sin_phi — learned phase
+            None,            # operator_scale 
+            None,            # metric_weight 
+        )
+
 
 #----------------------------------------------------------------------------
 # Loss from equation (4) of Jon's writeup
@@ -209,7 +336,7 @@ class KoopmanLoss:
     def __init__(self,
                  P_mean=-1.2, P_std=1.2, sigma_data=0.5,
                  sigma_min=1e-3, sigma_max=80, t_epsilon=1e-4,
-                 operator_scale=100.0):
+                 operator_scale=100.0, metric_weight=1.0):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -217,6 +344,7 @@ class KoopmanLoss:
         self.sigma_max = sigma_max
         self.t_epsilon = t_epsilon
         self.operator_scale = operator_scale
+        self.metric_weight = metric_weight
 
         # torch.func.jvp exists in torch>=2.0
         try:
@@ -250,53 +378,19 @@ class KoopmanLoss:
         with torch.no_grad():
             xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, sigma_data=self.sigma_data)
 
-        # print("t min/max", t.min().item(), t.max().item())
-        # print("sin(t) min", torch.sin(t).min().item())
-        # print("xdot finite?", torch.isfinite(xdot).all().item())
-        # print("xdot absmax", xdot.abs().max().item())
-        # print("xdot rms", xdot.square().mean().sqrt().item())
-
         tdot = torch.ones_like(t)  # dt/ds = 1 in the time-augmented system
 
         # ------------------------------------------------------------
         # (C) One JVP: (psi, Lpsi) where Lpsi = ∂t psi + ∇x psi · xdot
         # ------------------------------------------------------------
         raw_psi_net = psi_net
-
-        # # Check inputs to the whole system
-        # print(f"Input Check - x max: {x.abs().max():.2e}, t max: {t.abs().max():.2e}")
-        # print(f"Tangent Check - xdot max: {xdot.abs().max():.2e}, tdot max: {tdot.abs().max():.2e}")
-
-        # # Check augmentation labels specifically
-        # if augment_labels is not None:
-        #     print(f"Augment Check - labels max: {augment_labels.abs().max():.2e}")
         
         def f(x_in, t_in):
             # labels & augment_labels treated as constants (no grads through them)
             out = raw_psi_net(x_in, t_in, class_labels=labels, augment_labels=augment_labels, force_fp32=True)  # (B,2k)
-            if torch.isnan(out).any():
-                print("!!! raw_psi_net produced NaN in forward pass")
             return out
 
-        # def _jvp_f(_x_in, _t_in, _xdot, _tdot):
-        #     # All inputs are expected to be unbatched
-        #     _x_in = _x_in.unsqueeze(0)
-        #     _t_in = _t_in.unsqueeze(0)
-        #     _xdot = _xdot.unsqueeze(0)
-        #     _tdot = _tdot.unsqueeze(0)
-
-        #     _psi_hat, _Lpsi_hat = self._jvp(f, (_x_in, _t_in), (_xdot, _tdot))
-                                          
-        #     return _psi_hat.squeeze(0), _Lpsi_hat.squeeze(0)
-
-        # _vmapped_jvp_f = vmap(_jvp_f, randomness='different') 
-
-        # psi_hat, Lpsi_hat = _vmapped_jvp_f(x, t, xdot, tdot)  # both (B,2k)
-
         psi_hat, Lpsi_hat = self._jvp(f, (x, t), (xdot, tdot))  # both (B,2k)
-
-        if torch.isnan(psi_hat).any() or torch.isnan(Lpsi_hat).any():
-            print("!!! NaN in psi_hat or Lpsi_hat")
 
         # ------------------------------------------------------------
         # (D) Convert to complex (re/im) blocks: psi = psi_re + i psi_im
@@ -308,34 +402,70 @@ class KoopmanLoss:
 
         training_stats.report('Loss/psi_rms', (psi_re**2 + psi_im**2).mean().sqrt())
 
-        # ------------------------------------------------------------
-        # (E) Term 1:  -2 Σ_i Re( e^{i φ_i} <psi_i, L psi_i> ) / operator_scale
-        # ------------------------------------------------------------
-        ip_re, ip_im = complex_inner_batch(psi_re, psi_im, Lpsi_re, Lpsi_im)  # (k,) each
-        cos_phi, sin_phi = phase_net(t)  # (k,), (k,); phase_net ignores t, the arg is a no-op placeholder
-
-        # e^{iφ}(ip_re + i ip_im) real-part:
-        # Re( (cos + i sin)(ip_re + i ip_im) ) = cos*ip_re - sin*ip_im
-        real_sum = cos_phi * ip_re - sin_phi * ip_im    # (k,)
-        # Divide by operator_scale (≈ magnitude of Lψ) so term1 ~ O(‖ψ‖²),
-        # matching term2 ~ O(‖ψ‖⁴) at the scale where eigenfunctions are O(1).
-        term1 = -2.0 * real_sum.mean() / self.operator_scale
+        # phase_net ignores t, the arg is a placeholder
+        cos_phi, sin_phi = phase_net(t)  # (k,), (k,)
 
         # ------------------------------------------------------------
-        # (F) Term 2: Σ_{i,j} cos(φ_i - φ_j) |<psi_i,psi_j>|^2
+        # Sequential nesting via NeuralSVDFunction
+        #
+        # Split-batch cross-Gram estimator:
+        #   ψ_A (first half, active)  — receives gradients
+        #   ψ_B (second half, detached) — provides the target metric
         # ------------------------------------------------------------
-        G_re, G_im = complex_gram(psi_re, psi_im)          # (k,k), (k,k)
-        absG2 = G_re**2 + G_im**2                          # |G_ij|^2
 
-        # cos(φ_i - φ_j) = cosφ_i cosφ_j + sinφ_i sinφ_j
-        cos_dphi = cos_phi[:, None] * cos_phi[None, :] + sin_phi[:, None] * sin_phi[None, :]
-        term2 = (cos_dphi * absG2).mean()
+        half = B // 2
+        psi_A_re,  psi_A_im  = psi_re[:half],  psi_im[:half]   # (B/2,k) active
+        psi_B_re,  psi_B_im  = psi_re[half:],  psi_im[half:]   # (B/2,k) target (functionally detached)
+        Lpsi_A_re, Lpsi_A_im = Lpsi_re[:half], Lpsi_im[:half]  # (B/2,k) active
 
-        training_stats.report('Loss/term1', term1)
-        training_stats.report('Loss/term2', term2)
+        loss_svd = NeuralSVDFunction.apply(
+            psi_A_re, psi_A_im, Lpsi_A_re, Lpsi_A_im,
+            psi_B_re, psi_B_im,
+            cos_phi, sin_phi,
+            self.operator_scale,
+            self.metric_weight,
+        )
 
-        loss = term1 + term2
-        return loss
+        # Recover per-term values for stats — computed once without grad for logging only.
+        with torch.no_grad():
+            G_A_re_log = (psi_A_re.T @ psi_A_re + psi_A_im.T @ psi_A_im) / half
+            G_A_im_log = (-psi_A_im.T @ psi_A_re + psi_A_re.T @ psi_A_im) / half
+            G_B_re_log = (psi_B_re.T @ psi_B_re + psi_B_im.T @ psi_B_im) / half
+            G_B_im_log = (-psi_B_im.T @ psi_B_re + psi_B_re.T @ psi_B_im) / half
+            triu_log     = torch.triu(torch.ones(k, k, device=psi_re.device))
+            cos_dphi_log = cos_phi[:, None] * cos_phi[None, :] + sin_phi[:, None] * sin_phi[None, :]
+            D_log        = G_B_re_log * G_A_re_log + G_B_im_log * G_A_im_log
+            term2_log    = self.metric_weight * (triu_log * cos_dphi_log * D_log).sum()
+            ip_re_log    = (psi_A_re * Lpsi_A_re + psi_A_im * Lpsi_A_im).sum(0) / half
+            ip_im_log    = (-psi_A_im * Lpsi_A_re + psi_A_re * Lpsi_A_im).sum(0) / half
+            term1_log    = -2.0 * (cos_phi * ip_re_log - sin_phi * ip_im_log).sum() / self.operator_scale
+
+        training_stats.report('Loss/term1', term1_log / k)
+        training_stats.report('Loss/term2', term2_log / k)
+
+        # ------------------------------------------------------------
+        # (G) Eigenvalue magnitude stats  (use full non-detached psi)
+        # λ_i = e^{iφ_i} * ||ψ_i||²  →  |λ_i| = ||ψ_i||²
+        # ------------------------------------------------------------
+        psi_sq      = (psi_re**2 + psi_im**2).mean(dim=0)   # (k,)
+        lam_re_vals = cos_phi * psi_sq
+        lam_im_vals = sin_phi * psi_sq
+        lam_mag     = psi_sq
+
+        training_stats.report('Eigenvalues/lam_mag_min',  lam_mag.min())
+        training_stats.report('Eigenvalues/lam_mag_max',  lam_mag.max())
+        training_stats.report('Eigenvalues/lam_mag_mean', lam_mag.mean())
+        training_stats.report('Eigenvalues/lam_re_max',   lam_re_vals.max())
+        training_stats.report('Eigenvalues/lam_im_max',   lam_im_vals.max())
+
+        for i in range(k):
+            training_stats.report(f'Eigenvalues/lam_mag_{i:02d}', lam_mag[i])
+
+        # Store for histogram logging in the training loop.
+        self._last_lam_mag = lam_mag.detach()
+
+        return loss_svd
+
 
 
 
