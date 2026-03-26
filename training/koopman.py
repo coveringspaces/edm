@@ -153,9 +153,12 @@ class KoopmanPhases(nn.Module):
     """
     Train phases φ_i (real). These define unit-modulus eigenvalues e^{i φ_i}.
     """
-    def __init__(self, k: int, init_zero: bool = True):
+    def __init__(self, k: int, init_zero: bool = False):
         super().__init__()
-        phi0 = torch.zeros(k) if init_zero else 2 * torch.pi * torch.rand(k)
+        if init_zero:
+            phi0 = torch.zeros(k)
+        else:
+            phi0 = 2 * torch.pi * torch.arange(k) / k  # uniformly spaced in [0, 2π)
         self.phi = nn.Parameter(phi0)
 
     def forward(self, _dummy):
@@ -314,26 +317,29 @@ class NestedLoRALossFunctionEVD(torch.autograd.Function):
         B_half = ctx.B_half
         g = grad_output
 
-        # ── Metric gradients, Neural SVD f1/f2 style
-        # sym_mask = mask + mask.T absorbs the ROW contribution for asymmetric matrix_mask.
-        sym_mask = matrix_mask + matrix_mask.T                 # (k,k) symmetric
+        # ── Metric gradients
+        # Correct gradient: ∂L/∂ψ_re[b,m] ∝ Σ_l sym[l,m]·(Λ_re[l,m]·ψ_re[b,l] − Λ_im[l,m]·ψ_im[b,l])
+        #                   ∂L/∂ψ_im[b,m] ∝ Σ_l sym[l,m]·(Λ_re[l,m]·ψ_im[b,l] + Λ_im[l,m]·ψ_re[b,l])
+        # Equivalent to computing (Λ · ψ), not (conj(Λ) · ψ = Λᵀ · ψ).
+        # sym_mask = W + Wᵀ accounts for both row and column index contributions.
+        # sym_mask = matrix_mask + matrix_mask.T                 # (k,k) symmetric
         lam_1_re, lam_1_im = compute_complex_lambda(psi_A_re, psi_A_im)  # recompute; psi_A is saved
-        fac_met = g / B_half
+        fac_met = 2.0 *g / B_half
         grad_psi_A_re = fac_met * (
-            torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_re, psi_A_re)
-          + torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_im, psi_A_im)
+            torch.einsum('lm,lm,bl->bm', matrix_mask, lam_2_re, psi_A_re)
+          - torch.einsum('lm,lm,bl->bm', matrix_mask, lam_2_im, psi_A_im)
         )
         grad_psi_A_im = fac_met * (
-            torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_re, psi_A_im)
-          - torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_im, psi_A_re)
+            torch.einsum('lm,lm,bl->bm', matrix_mask, lam_2_re, psi_A_im)
+          + torch.einsum('lm,lm,bl->bm', matrix_mask, lam_2_im, psi_A_re)
         )
         grad_psi_B_re = fac_met * (
-            torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_re, psi_B_re)
-          + torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_im, psi_B_im)
+            torch.einsum('lm,lm,bl->bm', matrix_mask, lam_1_re, psi_B_re)
+          - torch.einsum('lm,lm,bl->bm', matrix_mask, lam_1_im, psi_B_im)
         )
         grad_psi_B_im = fac_met * (
-            torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_re, psi_B_im)
-          - torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_im, psi_B_re)
+            torch.einsum('lm,lm,bl->bm', matrix_mask, lam_1_re, psi_B_im)
+          + torch.einsum('lm,lm,bl->bm', matrix_mask, lam_1_im, psi_B_re)
         )
 
         # ── Operator gradient for ψ_A and Lψ_A
@@ -374,7 +380,8 @@ class KoopmanLoss:
     def __init__(self,
                  P_mean=-1.2, P_std=1.2, sigma_data=0.5,
                  sigma_min=1e-3, sigma_max=80, t_epsilon=1e-4,
-                 operator_scale=100.0):
+                 operator_scale=100.0, use_custom_autograd=False,
+                 normalize_psi_for_loss=False):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -382,6 +389,8 @@ class KoopmanLoss:
         self.sigma_max = sigma_max
         self.t_epsilon = t_epsilon
         self.operator_scale = operator_scale
+        self.use_custom_autograd = use_custom_autograd
+        self.normalize_psi_for_loss = normalize_psi_for_loss
 
         # torch.func.jvp exists in torch>=2.0
         try:
@@ -437,45 +446,84 @@ class KoopmanLoss:
 
         B, k = psi_re.shape
 
-        training_stats.report('Loss/psi_rms', (psi_re**2 + psi_im**2).mean().sqrt())
+        training_stats.report('Loss/psi_rms',  (psi_re**2  + psi_im**2).mean().sqrt())
+        training_stats.report('Loss/Lpsi_rms', (Lpsi_re**2 + Lpsi_im**2).mean().sqrt())
+
+        # Optional per-mode normalization for diagnostics (does not affect psi_rms/Lpsi_rms above).
+        if self.normalize_psi_for_loss:
+            norm = (psi_re**2 + psi_im**2).mean(dim=0).sqrt().clamp(min=1e-8)  # (k,)
+            psi_re  = psi_re  / norm
+            psi_im  = psi_im  / norm
+            Lpsi_re = Lpsi_re / norm
+            Lpsi_im = Lpsi_im / norm
 
         # phase_net ignores t, the arg is a placeholder
         cos_phi, sin_phi = phase_net(t)  # (k,), (k,)
 
         # ------------------------------------------------------------
-        # Sequential nesting via NeuralSVDFunction
-        #
-        # Split-batch cross-Gram estimator:
-        #   ψ_A (first half, active)  — receives gradients
-        #   ψ_B (second half, detached) — provides the target metric
+        # Operator term: full batch  (paper: use all of f, Tf)
+        # Metric term:   split halves for independent Gram estimates
+        #   ψ_A (first half)  — Gram estimate 1
+        #   ψ_B (second half) — Gram estimate 2 (detached as target)
         # ------------------------------------------------------------
 
         half = B // 2
-        psi_A_re,  psi_A_im  = psi_re[:half],  psi_im[:half]   # (B/2,k) active
-        psi_B_re,  psi_B_im  = psi_re[half:],  psi_im[half:]   # (B/2,k) target (functionally detached)
-        Lpsi_A_re, Lpsi_A_im = Lpsi_re[:half], Lpsi_im[:half]  # (B/2,k) active
+        psi_A_re,  psi_A_im  = psi_re[:half],  psi_im[:half]   # (B/2,k)
+        psi_B_re,  psi_B_im  = psi_re[half:],  psi_im[half:]   # (B/2,k)
 
-        loss_svd = NestedLoRALossFunctionEVD.apply(
-            psi_A_re, psi_A_im, Lpsi_A_re, Lpsi_A_im,
-            psi_B_re, psi_B_im,
-            cos_phi, sin_phi,
-            self.operator_scale,
-        )
+        if self.use_custom_autograd:
+            Lpsi_A_re, Lpsi_A_im = Lpsi_re[:half], Lpsi_im[:half]
+            loss_svd = NestedLoRALossFunctionEVD.apply(
+                psi_A_re, psi_A_im, Lpsi_A_re, Lpsi_A_im,
+                psi_B_re, psi_B_im,
+                cos_phi, sin_phi,
+                self.operator_scale,
+            )
+        else:
+            # Plain-autograd path — operator on full batch, metric on split halves.
+
+            # Operator term: full batch
+            ip_re = (psi_re * Lpsi_re + psi_im * Lpsi_im).sum(0) / B
+            ip_im = (-psi_im * Lpsi_re + psi_re * Lpsi_im).sum(0) / B
+            loss_operator = -2.0 * (cos_phi * ip_re - sin_phi * ip_im).sum() / self.operator_scale
+
+            # Metric term: split-batch cross-Gram (both halves receive gradients)
+            lam_1_re, lam_1_im = compute_complex_lambda(psi_A_re, psi_A_im)
+            lam_2_re, lam_2_im = compute_complex_lambda(psi_B_re, psi_B_im)
+
+            _, M_seq    = get_sequential_nesting_masks(k, psi_re.device)
+            cos_dphi    = cos_phi[:, None] * cos_phi[None, :] + sin_phi[:, None] * sin_phi[None, :]
+            matrix_mask = M_seq * cos_dphi
+
+            D           = lam_2_re * lam_1_re + lam_2_im * lam_1_im
+            loss_metric = (matrix_mask * D).sum()
+
+            loss_svd = loss_operator + loss_metric
 
         # Recover per-term values for stats — computed once without grad for logging only.
         with torch.no_grad():
+            ip_re_log     = (psi_re * Lpsi_re + psi_im * Lpsi_im).sum(0) / B
+            ip_im_log     = (-psi_im * Lpsi_re + psi_re * Lpsi_im).sum(0) / B
+            loss_operator_log = -2.0 * (cos_phi * ip_re_log - sin_phi * ip_im_log).sum() / self.operator_scale
             lam_1_re_log, lam_1_im_log = compute_complex_lambda(psi_A_re, psi_A_im)
             lam_2_re_log, lam_2_im_log = compute_complex_lambda(psi_B_re, psi_B_im)
-            _, M_seq_log  = get_sequential_nesting_masks(k, psi_re.device)  # M_{i,ell}=1[i<=ell]
+            _, M_seq_log  = get_sequential_nesting_masks(k, psi_re.device)
             cos_dphi_log  = cos_phi[:, None] * cos_phi[None, :] + sin_phi[:, None] * sin_phi[None, :]
             D_log         = lam_2_re_log * lam_1_re_log + lam_2_im_log * lam_1_im_log
             loss_metric_log = (M_seq_log * cos_dphi_log * D_log).sum()
-            ip_re_log     = (psi_A_re * Lpsi_A_re + psi_A_im * Lpsi_A_im).sum(0) / half
-            ip_im_log     = (-psi_A_im * Lpsi_A_re + psi_A_re * Lpsi_A_im).sum(0) / half
-            loss_operator_log = -2.0 * (cos_phi * ip_re_log - sin_phi * ip_im_log).sum() / self.operator_scale
+
+            # Decompose Lpsi into time and spatial components for diagnostics.
+            _, dtpsi_hat_log  = self._jvp(f, (x, t), (torch.zeros_like(x), tdot))
+            dxpsi_hat_log     = Lpsi_hat - dtpsi_hat_log               # Lpsi = dtpsi + dxpsi
+            dtpsi_re_log, dtpsi_im_log = split_reim(dtpsi_hat_log)
+            dxpsi_re_log, dxpsi_im_log = split_reim(dxpsi_hat_log)
 
         training_stats.report('Loss/loss_operator', loss_operator_log)
         training_stats.report('Loss/loss_metric',   loss_metric_log)
+        training_stats.report('Loss/dtpsi_rms',     (dtpsi_re_log**2 + dtpsi_im_log**2).mean().sqrt())
+        training_stats.report('Loss/dxpsi_rms',     (dxpsi_re_log**2 + dxpsi_im_log**2).mean().sqrt())
+        training_stats.report('Loss/xdot_rms',      (xdot**2).mean().sqrt())
+        training_stats.report('Loss/abs_ip_mean',   (ip_re_log**2 + ip_im_log**2).sqrt().mean())
 
         # ------------------------------------------------------------
         # (G) Eigenvalue magnitude stats  (use full non-detached psi)
