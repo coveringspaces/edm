@@ -211,15 +211,49 @@ def koopman_training_loop(
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
 
-    while True:
-        optimizer.zero_grad(set_to_none=True)
+    def _allreduce_and_step():
+        """All-reduce grads, apply LR ramp, NaN-guard, clip, then step."""
+        if dist.get_world_size() > 1:
+            for param in train_params:
+                if param.grad is not None:
+                    torch.distributed.all_reduce(param.grad)
+                    param.grad.div_(dist.get_world_size())
+        for g in optimizer.param_groups:
+            base_lr = optimizer_kwargs.get('lr', g.get('lr', 1e-4))
+            g['lr'] = base_lr * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1.0)
+        for p in train_params:
+            if p.grad is not None:
+                torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
+        grad_norm = torch.sqrt(sum(p.grad.norm()**2 for p in train_params if p.grad is not None))
+        training_stats.report('Grads/grad_norm', grad_norm)
+        torch.nn.utils.clip_grad_norm_(train_params, max_norm=grad_clip_norm)
+        clipped_norm = torch.sqrt(sum(p.grad.norm()**2 for p in train_params if p.grad is not None))
+        training_stats.report('Grads/grad_norm_clipped', clipped_norm)
+        optimizer.step()
 
+    def _ema_and_count():
+        """EMA update + cur_nimg increment for one optimizer step worth of batch_size images."""
+        nonlocal cur_nimg
+        ema_halflife_nimg = ema_halflife_kimg * 1000
+        if ema_rampup_ratio is not None:
+            ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
+        ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
+        with torch.no_grad():
+            for p_ema, p_net in zip(ema_psi.parameters(), psi_net.parameters()):
+                p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+            for p_ema, p_net in zip(ema_phase.parameters(), phase_net.parameters()):
+                p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+        cur_nimg += batch_size
+
+    while True:
+        # One forward pass, one loss, one backward, one optimizer step.
+        # Joint and sequential nesting both follow this path; they differ only by the
+        # struct mask inside KoopmanLoss (ones for joint, upper-triangular for sequential).
+        optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             images, labels = next(dataset_iterator)
             images = images.to(device).to(torch.float32) / 127.5 - 1
             labels = labels.to(device)
-
-            # IMPORTANT: CFM is frozen; KoopmanLoss already uses no_grad() around xdot.
             loss = koop_loss(
                 psi_net=psi_net,
                 phase_net=phase_net,
@@ -228,53 +262,10 @@ def koopman_training_loop(
                 labels=labels,
                 augment_pipe=augment_pipe,
             )
-
             training_stats.report('Loss/koopman', loss)
             loss.mul(loss_scaling / batch_gpu_total).backward()
-
-        # Manually all-reduce gradients across GPUs (replaces DDP all-reduce hooks).
-        if dist.get_world_size() > 1:
-            for param in train_params:
-                if param.grad is not None:
-                    torch.distributed.all_reduce(param.grad)
-                    param.grad.div_(dist.get_world_size())
-
-        # LR ramp.
-        for g in optimizer.param_groups:
-            base_lr = optimizer_kwargs.get('lr', g.get('lr', 1e-4))
-            g['lr'] = base_lr * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1.0)
-
-        # NaN guards.
-        for p in train_params:
-            if p.grad is not None:
-                torch.nan_to_num(p.grad, nan=0, posinf=1e5, neginf=-1e5, out=p.grad)
-
-        # Compute and report grad norm before clipping.
-        grad_norm = torch.sqrt(sum(p.grad.norm()**2 for p in train_params if p.grad is not None))
-        training_stats.report('Grads/grad_norm', grad_norm)
-
-        # Gradient clipping: xdot varies ~1000x across the noise schedule, causing
-        # occasional huge gradient spikes that overshoot the optimum.
-        torch.nn.utils.clip_grad_norm_(train_params, max_norm=grad_clip_norm)
-        clipped_norm = torch.sqrt(sum(p.grad.norm()**2 for p in train_params if p.grad is not None))
-        training_stats.report('Grads/grad_norm_clipped', clipped_norm)
-
-        optimizer.step()
-
-        # EMA update.
-        ema_halflife_nimg = ema_halflife_kimg * 1000
-        if ema_rampup_ratio is not None:
-            ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
-        ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
-
-        with torch.no_grad():
-            for p_ema, p_net in zip(ema_psi.parameters(), psi_net.parameters()):
-                p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
-            for p_ema, p_net in zip(ema_phase.parameters(), phase_net.parameters()):
-                p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
-
-        # Tick / logging.
-        cur_nimg += batch_size
+        _allreduce_and_step()
+        _ema_and_count()
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
             continue
