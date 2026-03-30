@@ -59,7 +59,7 @@ def parse_int_list(s):
 @click.option('--cres',         help='Channel mult list', metavar='LIST',                  type=parse_int_list, default='1,2,3,4', show_default=True)
 @click.option('--dropout',      help='Dropout probability', metavar='FLOAT',               type=click.FloatRange(min=0, max=1), default=0.10, show_default=True)
 @click.option('--operator-scale',      help='Scale of CFM vector field (divides term1)', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=100.0, show_default=True)
-@click.option('--normalize-psi-loss', help='Normalize psi per-mode before loss (diagnostic)', is_flag=True, default=False)
+@click.option('--init-log-r',  help='Initial log(r) for eigenvalue magnitudes', metavar='FLOAT', type=float, default=0.0, show_default=True)
 @click.option('--grad-clip',    help='Max gradient norm for clipping', metavar='FLOAT',            type=click.FloatRange(min=0, min_open=True), default=100.0, show_default=True)
 
 # Augment (optional; same as EDM train.py pattern).
@@ -154,6 +154,11 @@ def main(**kwargs):
         k=opts.k,
         init_zero=False,
     )
+    c.magnitude_kwargs = dnnlib.EasyDict(
+        class_name='training.koopman.KoopmanMagnitudes',
+        k=opts.k,
+        init_log_r=opts.init_log_r,
+    )
 
     # Koopman loss.
     c.koopman_loss_kwargs = dnnlib.EasyDict(
@@ -165,8 +170,6 @@ def main(**kwargs):
         sigma_max=80,
         t_epsilon=1e-4,
         operator_scale=opts.operator_scale,
-        normalize_psi_for_loss=opts.normalize_psi_loss,
-
     )
 
     # Optimizer.

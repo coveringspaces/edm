@@ -166,6 +166,22 @@ class KoopmanPhases(nn.Module):
         return torch.cos(self.phi), torch.sin(self.phi)
 
 
+class KoopmanMagnitudes(nn.Module):
+    """
+    Learnable eigenvalue magnitudes r_i > 0, parameterized as r_i = exp(log_r_i).
+
+    Decouples eigenvalue magnitude from eigenfunction norm:
+        λ_i = r_i² · e^{iφ_i}
+    while the network output ψ is normalized to unit norm in the loss.
+    """
+    def __init__(self, k: int, init_log_r: float = 0.0):
+        super().__init__()
+        self.log_r = nn.Parameter(torch.full((k,), init_log_r))
+
+    def forward(self, _dummy):
+        return torch.exp(self.log_r)  # (k,) positive magnitudes
+
+
 def complex_mul_reim(lam_re, lam_im, psi_re, psi_im):
     # (lam_re + i lam_im) * (psi_re + i psi_im)
     out_re = lam_re * psi_re - lam_im * psi_im
@@ -379,8 +395,7 @@ class KoopmanLoss:
     def __init__(self,
                  P_mean=-1.2, P_std=1.2, sigma_data=0.5,
                  sigma_min=1e-3, sigma_max=80, t_epsilon=1e-4,
-                 operator_scale=100.0,
-                 normalize_psi_for_loss=False):
+                 operator_scale=100.0):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -388,7 +403,6 @@ class KoopmanLoss:
         self.sigma_max = sigma_max
         self.t_epsilon = t_epsilon
         self.operator_scale = operator_scale
-        self.normalize_psi_for_loss = normalize_psi_for_loss
 
         # torch.func.jvp exists in torch>=2.0
         try:
@@ -397,7 +411,7 @@ class KoopmanLoss:
         except Exception:
             self._jvp = None
 
-    def __call__(self, psi_net, phase_net, cfm_net, images, labels=None, augment_pipe=None):
+    def __call__(self, psi_net, phase_net, mag_net, cfm_net, images, labels=None, augment_pipe=None):
         assert self._jvp is not None, "Need torch.func.jvp (PyTorch 2.x)."
 
         # ------------------------------------------------------------
@@ -480,16 +494,28 @@ class KoopmanLoss:
 
         B, k = psi_re.shape
 
+        training_stats.report('Loss/psi_raw_rms',  (psi_re**2  + psi_im**2).mean().sqrt())
+        training_stats.report('Loss/Lpsi_raw_rms', (Lpsi_re**2 + Lpsi_im**2).mean().sqrt())
+
+        # ── Normalize ψ per-mode (detached norm) and rescale by learned magnitudes.
+        # This decouples eigenvalue magnitude from eigenfunction norm:
+        #   ψ_scaled_i = r_i * ψ̂_i   where ||ψ̂_i|| ≈ 1 (batch estimate)
+        #   Lψ_scaled_i = r_i * Lψ̂_i
+        # The loss then finds: λ_i = r_i² · e^{iφ_i}
+        norm = (psi_re**2 + psi_im**2).mean(dim=0).sqrt().clamp(min=1e-8).detach()  # (k,)
+        psi_re  = psi_re  / norm
+        psi_im  = psi_im  / norm
+        Lpsi_re = Lpsi_re / norm
+        Lpsi_im = Lpsi_im / norm
+
+        r = mag_net(t)  # (k,) positive magnitudes
+        psi_re  = psi_re  * r
+        psi_im  = psi_im  * r
+        Lpsi_re = Lpsi_re * r
+        Lpsi_im = Lpsi_im * r
+
         training_stats.report('Loss/psi_rms',  (psi_re**2  + psi_im**2).mean().sqrt())
         training_stats.report('Loss/Lpsi_rms', (Lpsi_re**2 + Lpsi_im**2).mean().sqrt())
-
-        # Optional per-mode normalization for diagnostics (does not affect psi_rms/Lpsi_rms above).
-        if self.normalize_psi_for_loss:
-            norm = (psi_re**2 + psi_im**2).mean(dim=0).sqrt().clamp(min=1e-8)  # (k,)
-            psi_re  = psi_re  / norm
-            psi_im  = psi_im  / norm
-            Lpsi_re = Lpsi_re / norm
-            Lpsi_im = Lpsi_im / norm
 
         # phase_net ignores t, the arg is a placeholder
         cos_phi, sin_phi = phase_net(t)  # (k,), (k,)
@@ -543,17 +569,22 @@ class KoopmanLoss:
         training_stats.report('Loss/abs_ip_mean',   (ip_re_log**2 + ip_im_log**2).sqrt().mean())
 
         # ------------------------------------------------------------
-        # (G) Eigenvalue magnitude stats  (use full non-detached psi)
-        # λ_i = e^{iφ_i} * ||ψ_i||²  →  |λ_i| = ||ψ_i||²
+        # (G) Eigenvalue magnitude stats
+        # λ_i = r_i² · e^{iφ_i}  →  |λ_i| = r_i²
+        # (ψ is normalized, so ||ψ̂_i|| ≈ 1 and the magnitude lives in r_i)
         # ------------------------------------------------------------
-        psi_sq      = (psi_re**2 + psi_im**2).mean(dim=0)   # (k,)
-        lam_re_vals = cos_phi * psi_sq
-        lam_im_vals = sin_phi * psi_sq
-        lam_mag     = psi_sq
+        r_detached  = r.detach()
+        lam_mag     = r_detached ** 2                         # (k,)
+        lam_re_vals = cos_phi * lam_mag
+        lam_im_vals = sin_phi * lam_mag
 
-        training_stats.report('Eigenvalues/lam_mag_min',  lam_mag.min())
-        training_stats.report('Eigenvalues/lam_mag_max',  lam_mag.max())
-        training_stats.report('Eigenvalues/lam_mag_mean', lam_mag.mean())
+        training_stats.report('Eigenvalues/r_min',         r_detached.min())
+        training_stats.report('Eigenvalues/r_max',         r_detached.max())
+        training_stats.report('Eigenvalues/r_mean',        r_detached.mean())
+        training_stats.report('Eigenvalues/psi_raw_norm',  norm.mean())
+        training_stats.report('Eigenvalues/lam_mag_min',   lam_mag.min())
+        training_stats.report('Eigenvalues/lam_mag_max',   lam_mag.max())
+        training_stats.report('Eigenvalues/lam_mag_mean',  lam_mag.mean())
         training_stats.report('Eigenvalues/lam_re_max',   lam_re_vals.max())
         training_stats.report('Eigenvalues/lam_im_max',   lam_im_vals.max())
 

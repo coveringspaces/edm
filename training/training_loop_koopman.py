@@ -22,6 +22,7 @@ def koopman_training_loop(
     # --- Koopman pieces (trainable) ---
     psi_network_kwargs  = {},       # construct_class_by_name(...) for KoopmanEigenNet
     phase_kwargs        = {},       # construct_class_by_name(...) for KoopmanPhases
+    magnitude_kwargs    = {},       # construct_class_by_name(...) for KoopmanMagnitudes
     koopman_loss_kwargs = {},       # construct_class_by_name(...) for KoopmanLoss
     optimizer_kwargs    = {},       # torch.optim.* kwargs for psi+phase params
 
@@ -142,6 +143,9 @@ def koopman_training_loop(
     phase_net = dnnlib.util.construct_class_by_name(**phase_kwargs)  # expects k inside kwargs or class default
     phase_net.train().requires_grad_(True).to(device)
 
+    mag_net = dnnlib.util.construct_class_by_name(**magnitude_kwargs)
+    mag_net.train().requires_grad_(True).to(device)
+
     # Optional: print summary for psi_net.
     if dist.get_rank() == 0:
         with torch.no_grad():
@@ -161,8 +165,8 @@ def koopman_training_loop(
     koop_loss = dnnlib.util.construct_class_by_name(**koopman_loss_kwargs)  # your KoopmanLoss
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None
 
-    # Trainable params = psi_net + phase_net
-    train_params = list(psi_net.parameters()) + list(phase_net.parameters())
+    # Trainable params = psi_net + phase_net + mag_net
+    train_params = list(psi_net.parameters()) + list(phase_net.parameters()) + list(mag_net.parameters())
     optimizer = dnnlib.util.construct_class_by_name(params=train_params, **optimizer_kwargs)
 
     # No DDP wrappers: torch.func.jvp is incompatible with DDP.
@@ -170,6 +174,7 @@ def koopman_training_loop(
 
     ema_psi = copy.deepcopy(psi_net).eval().requires_grad_(False)
     ema_phase = copy.deepcopy(phase_net).eval().requires_grad_(False)
+    ema_mag = copy.deepcopy(mag_net).eval().requires_grad_(False)
 
     # 1. Ensure all parameters are synced, including unused ones
     if dist.get_world_size() > 1:
@@ -178,11 +183,15 @@ def koopman_training_loop(
             torch.distributed.broadcast(param.data, src=0)
         for param in phase_net.parameters():
             torch.distributed.broadcast(param.data, src=0)
-        
+        for param in mag_net.parameters():
+            torch.distributed.broadcast(param.data, src=0)
+
         # 2. Sync EMA buffers to prevent save-time drift
         for p_ema in ema_psi.parameters():
             torch.distributed.broadcast(p_ema.data, src=0)
         for p_ema in ema_phase.parameters():
+            torch.distributed.broadcast(p_ema.data, src=0)
+        for p_ema in ema_mag.parameters():
             torch.distributed.broadcast(p_ema.data, src=0)
 
     dist.print0('Initialization complete. Starting training loop...')
@@ -193,6 +202,8 @@ def koopman_training_loop(
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
         misc.copy_params_and_buffers(src_module=data['psi_net'], dst_module=psi_net, require_all=True)
         misc.copy_params_and_buffers(src_module=data['phase_net'], dst_module=phase_net, require_all=True)
+        if 'mag_net' in data:
+            misc.copy_params_and_buffers(src_module=data['mag_net'], dst_module=mag_net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
         del data
 
@@ -243,6 +254,8 @@ def koopman_training_loop(
                 p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
             for p_ema, p_net in zip(ema_phase.parameters(), phase_net.parameters()):
                 p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+            for p_ema, p_net in zip(ema_mag.parameters(), mag_net.parameters()):
+                p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
         cur_nimg += batch_size
 
     while True:
@@ -257,6 +270,7 @@ def koopman_training_loop(
             loss = koop_loss(
                 psi_net=psi_net,
                 phase_net=phase_net,
+                mag_net=mag_net,
                 cfm_net=cfm_net,
                 images=images,
                 labels=labels,
@@ -295,14 +309,17 @@ def koopman_training_loop(
             data = dict(
                 psi_ema=copy.deepcopy(ema_psi).eval().requires_grad_(False),
                 phase_ema=copy.deepcopy(ema_phase).eval().requires_grad_(False),
+                mag_ema=copy.deepcopy(ema_mag).eval().requires_grad_(False),
                 # Also store non-EMA if you want:
                 psi_net=copy.deepcopy(psi_net).eval().requires_grad_(False),
                 phase_net=copy.deepcopy(phase_net).eval().requires_grad_(False),
+                mag_net=copy.deepcopy(mag_net).eval().requires_grad_(False),
                 # record how we got the vector field:
                 cfm_resume_pkl=cfm_resume_pkl,
                 dataset_kwargs=dict(dataset_kwargs),
                 psi_network_kwargs=dict(psi_network_kwargs),
                 phase_kwargs=dict(phase_kwargs),
+                magnitude_kwargs=dict(magnitude_kwargs),
                 koopman_loss_kwargs=dict(koopman_loss_kwargs),
             )
             # Check parameter consistency across ranks, then move to CPU for pickling.
@@ -326,6 +343,7 @@ def koopman_training_loop(
                 dict(
                     psi_net=psi_net,
                     phase_net=phase_net,
+                    mag_net=mag_net,
                     optimizer_state=optimizer.state_dict(),
                 ),
                 os.path.join(run_dir, f'koopman-training-state-{cur_nimg//1000:06d}.pt')

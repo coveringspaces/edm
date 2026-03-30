@@ -85,12 +85,15 @@ def load_snapshot(pkl_path: str, device: torch.device):
         data = pickle.load(f)
     psi_net   = data['psi_ema'].to(device).eval().requires_grad_(False)
     phase_net = data['phase_ema'].to(device).eval().requires_grad_(False)
+    mag_net   = data.get('mag_ema', None)
+    if mag_net is not None:
+        mag_net = mag_net.to(device).eval().requires_grad_(False)
     # Pull image resolution out of stored dataset_kwargs if available.
     meta = {}
     dkw = data.get('dataset_kwargs', {})
     if 'resolution' in dkw:
         meta['img_resolution'] = dkw['resolution']
-    return psi_net, phase_net, meta
+    return psi_net, phase_net, mag_net, meta
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +101,7 @@ def load_snapshot(pkl_path: str, device: torch.device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def estimate_coefficients(psi_net, phase_net, *,
+def estimate_coefficients(psi_net, phase_net, mag_net, *,
                            img_shape, label_dim,
                            num_samples, batch_size, t0, device):
     """
@@ -106,6 +109,12 @@ def estimate_coefficients(psi_net, phase_net, *,
     -------
     lam_re, lam_im  : (k,)       real / imag parts of λ_i
     c_re,   c_im    : (k,C,H,W)  real / imag parts of c_i
+
+    When mag_net is present (new snapshots), eigenvalue magnitude comes from
+    the learned r_i parameters: |λ_i| = r_i².  The eigenfunctions are
+    normalized at inference time to match training.
+
+    For legacy snapshots without mag_net, falls back to |λ_i| = E[|ψ_i|²].
     """
     C, H, W = img_shape
     k = psi_net.k
@@ -132,7 +141,7 @@ def estimate_coefficients(psi_net, phase_net, *,
         psi_re  = psi_hat[:, :k]   # (bs, k)
         psi_im  = psi_hat[:, k:]   # (bs, k)
 
-        # Accumulate |ψ_i|² for eigenvalue magnitude
+        # Accumulate |ψ_i|² for eigenvalue magnitude (used for normalization + legacy fallback)
         psi_sq_acc += (psi_re**2 + psi_im**2).sum(dim=0)
 
         # c_i = E[conj(ψ_i) * x0]
@@ -147,11 +156,26 @@ def estimate_coefficients(psi_net, phase_net, *,
     c_re        = c_re_acc   / n_done   # (k, C, H, W)
     c_im        = c_im_acc   / n_done   # (k, C, H, W)
 
-    # λ_i = e^{iφ_i} * E[|ψ_i|²]
     dummy = torch.zeros(1, device=device)
     cos_phi, sin_phi = phase_net(dummy)          # (k,)
-    lam_re = cos_phi * psi_sq_mean               # (k,)
-    lam_im = sin_phi * psi_sq_mean               # (k,)
+
+    if mag_net is not None:
+        # New parameterization: ψ is normalized in training, eigenvalue magnitude = r_i².
+        # Normalize the coefficients to match: c_i was computed with raw ψ, so divide by norm.
+        psi_norm = psi_sq_mean.sqrt().clamp(min=1e-8)   # (k,)
+        c_re = c_re / psi_norm[:, None, None, None]
+        c_im = c_im / psi_norm[:, None, None, None]
+        r = mag_net(dummy)                               # (k,)
+        lam_mag = r ** 2
+        # Also scale coefficients by r (since ψ_scaled = r * ψ̂ in training)
+        c_re = c_re * r[:, None, None, None]
+        c_im = c_im * r[:, None, None, None]
+    else:
+        # Legacy: |λ_i| = E[|ψ_i|²]
+        lam_mag = psi_sq_mean
+
+    lam_re = cos_phi * lam_mag                   # (k,)
+    lam_im = sin_phi * lam_mag                   # (k,)
 
     return lam_re, lam_im, c_re, c_im
 
@@ -256,7 +280,7 @@ def main():
 
     # Load -----------------------------------------------------------------
     print(f'Loading {args.pkl} ...')
-    psi_net, phase_net, meta = load_snapshot(args.pkl, device)
+    psi_net, phase_net, mag_net, meta = load_snapshot(args.pkl, device)
     k         = psi_net.k
     label_dim = psi_net.label_dim
 
@@ -272,7 +296,7 @@ def main():
     # Estimate coefficients ------------------------------------------------
     print(f'Estimating coefficients over {args.num_coeff_samples} noise samples ...')
     lam_re, lam_im, c_re, c_im = estimate_coefficients(
-        psi_net, phase_net,
+        psi_net, phase_net, mag_net,
         img_shape=img_shape, label_dim=label_dim,
         num_samples=args.num_coeff_samples,
         batch_size=args.batch,

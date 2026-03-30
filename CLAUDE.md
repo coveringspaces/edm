@@ -96,10 +96,11 @@ All model architectures and preconditioning wrappers:
 Second-stage Koopman Flow Matching:
 - `DhariwalEncoderOnly` — strips the decoder from `DhariwalUNet`, keeps mapping + encoder
 - `KoopmanEigenNet` — encoder-only network outputting `(B, 2k)` real values representing `k` complex eigenfunctions `ψ_i(x,t)`
-- `KoopmanPhases` — learnable phase parameters `φ_i` defining the *phase* of each eigenvalue; the full eigenvalue is `λ_i = e^{iφ_i} · ‖ψ_{θ,i}‖²`, so the magnitude `|λ_i| = ‖ψ_{θ,i}‖²` is determined by the network output, not fixed at 1
+- `KoopmanPhases` — learnable phase parameters `φ_i` defining the *phase* of each eigenvalue
+- `KoopmanMagnitudes` — learnable magnitude parameters `r_i > 0` (parameterized as `exp(log_r_i)`); the full eigenvalue is `λ_i = r_i² · e^{iφ_i}`, decoupled from the eigenfunction norm
 - `KoopmanLoss` — uses `torch.func.jvp` to compute directional derivatives of ψ along the CFM vector field; enforces `dψ/dt = iφ * ψ` (eigenfunction equation) plus an anti-collapse regularizer
-  - **Eigenvalue magnitude**: NOT constrained to 1. Forcing `‖ψ_{θ,i}‖ = 1` would force `|λ_i| = 1`, which assumes the Koopman operator is unitary — not generally true for a learned CFM vector field. Per-component normalization is therefore NOT applied.
-  - **Loss minimum**: `ψ=0` gives loss=0 but is a saddle, not the global minimum. The true minimum is achieved when the `ψ_i` are eigenfunctions of the CFM Koopman operator with eigenvalues `λ_i = e^{iφ_i} · ‖ψ_{θ,i}‖²`.
+  - **Eigenvalue magnitude**: Decoupled from eigenfunction norm via `KoopmanMagnitudes`. The network output ψ is normalized per-mode (detached batch norm) then rescaled by learned magnitudes `r_i`. This prevents unbounded growth of ψ while allowing eigenvalue magnitudes to be learned stably as scalar parameters.
+  - **Loss minimum**: `ψ=0` gives loss=0 but is a saddle, not the global minimum. The true minimum is achieved when the `ψ_i` are eigenfunctions of the CFM Koopman operator with eigenvalues `λ_i = r_i² · e^{iφ_i}`.
 
 ### `training/training_loop.py` / `training/training_loop_koopman.py`
 Both loops follow the same pattern: DDP wrapping, EMA tracking, gradient accumulation, periodic snapshot saves (`network-snapshot-*.pkl`) and state dumps (`training-state-*.pt` / `koopman-training-state-*.pt`).
