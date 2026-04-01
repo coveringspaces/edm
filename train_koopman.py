@@ -165,7 +165,6 @@ def main(**kwargs):
         sigma_max=80,
         t_epsilon=1e-4,
         operator_scale=opts.operator_scale,
-        normalize_psi_for_loss=opts.normalize_psi_loss,
 
     )
 

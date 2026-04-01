@@ -149,9 +149,9 @@ def estimate_coefficients(psi_net, phase_net, *,
 
     # λ_i = e^{iφ_i} * E[|ψ_i|²]
     dummy = torch.zeros(1, device=device)
-    cos_phi, sin_phi = phase_net(dummy)          # (k,)
-    lam_re = cos_phi * psi_sq_mean               # (k,)
-    lam_im = sin_phi * psi_sq_mean               # (k,)
+    phi = phase_net(dummy)                        # (k,)
+    lam_re = torch.cos(phi) * psi_sq_mean        # (k,)
+    lam_im = torch.sin(phi) * psi_sq_mean        # (k,)
 
     return lam_re, lam_im, c_re, c_im
 
