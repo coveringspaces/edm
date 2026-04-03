@@ -137,29 +137,24 @@ class KoopmanEigenNet(nn.Module):
 
         return psi_hat
 
-def _to_complex_vec(psi_hat, k: int):
-    # psi_hat: (B,2k) -> complex (B,k)
-    if torch.is_complex(psi_hat):
-        return psi_hat
-    B, C = psi_hat.shape
-    assert C == 2*k
-    psi_hat = psi_hat.view(B, k, 2)
-    return psi_hat[..., 0] + 1j * psi_hat[..., 1]
-
 class KoopmanPhases(nn.Module):
     """
     Train phases φ_i (real). These define unit-modulus eigenvalues e^{i φ_i}.
+    If label_dim > 0, one phase vector per class (lookup by one-hot label).
     """
-    def __init__(self, k: int, init_zero: bool = False):
+    def __init__(self, k: int, label_dim: int = 0, init_zero: bool = False):
         super().__init__()
-        if init_zero:
-            phi0 = torch.zeros(k)
-        else:
-            phi0 = 2 * torch.pi * torch.arange(k) / k  # uniformly spaced in [0, 2π)
-        self.phi = nn.Parameter(phi0)
+        self.k = k
+        self.label_dim = label_dim
+        phi0 = torch.zeros(k) if init_zero else 2 * torch.pi * torch.arange(k) / k
+        n = max(label_dim, 1)
+        self.phi = nn.Parameter(phi0.unsqueeze(0).expand(n, -1).clone())  # (n, k)
 
-    def forward(self, _dummy):
-        return self.phi
+    def forward(self, labels=None):
+        if self.label_dim > 0 and labels is not None:
+            class_idx = labels.argmax(dim=-1)   # (B,)
+            return self.phi[class_idx]           # (B, k)
+        return self.phi[0]                       # (k,)
 
 
 def complex_mul_reim(lam_re, lam_im, psi_re, psi_im):
@@ -175,40 +170,6 @@ def split_reim(psi_hat: torch.Tensor):
     B, two_k = psi_hat.shape
     k = two_k // 2
     return psi_hat[:, :k], psi_hat[:, k:]
-
-def complex_inner_batch(a_re, a_im, b_re, b_im):
-    """
-    a,b: (B,k)
-    returns inner products per component: (k,) complex as (re,im)
-      <a_i, b_i> over batch.
-    """
-    # conj(a) * b = (a_re - i a_im)(b_re + i b_im)
-    prod_re = a_re * b_re + a_im * b_im
-    prod_im = -a_im * b_re + a_re * b_im
-    return prod_re.mean(dim=0), prod_im.mean(dim=0)
-
-def complex_gram(psi_re, psi_im):
-    """
-    psi: (B,k) -> G: (k,k) complex (re,im) where G_ij = <psi_i, psi_j>.
-    """
-    B = psi_re.shape[0]
-    # conj(psi)^T psi
-    # real: psi_re^T psi_re + psi_im^T psi_im
-    G_re = (psi_re.T @ psi_re + psi_im.T @ psi_im) / B
-    # imag: -psi_im^T psi_re + psi_re^T psi_im
-    G_im = (-psi_im.T @ psi_re + psi_re.T @ psi_im) / B
-    return G_re, G_im
-
-def compute_complex_lambda(psi_re, psi_im):
-    """
-    Analogous to Neural SVD compute_lambda, but for complex eigenfunctions.
-    psi: (B,k) -> (lam_re, lam_im) each (k,k)
-    lam = psi†psi / B  (complex Gram matrix)
-    """
-    B = psi_re.shape[0]
-    lam_re = (psi_re.T @ psi_re + psi_im.T @ psi_im) / B
-    lam_im = (-psi_im.T @ psi_re + psi_re.T @ psi_im) / B
-    return lam_re, lam_im
 
 def get_sequential_nesting_masks(L: int, device=None):
     """
@@ -252,13 +213,14 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        psi,         # (B, 2k)      full batch, stacked [u, v]
-        Lpsi,        # (B, 2k)      full batch, stacked [Lu, Lv]
-        psi_1,       # (B_half, 2k) first half batch, stacked [u^(1), v^(1)]
-        psi_2,       # (B_half, 2k) second half batch, stacked [u^(2), v^(2)]
-        phi,         # (k,)
-        vector_mask, # (k,)
-        matrix_mask, # (k, k)
+        psi,           # (B, 2k)      full batch, stacked [u, v]
+        Lpsi,          # (B, 2k)      full batch, stacked [Lu, Lv]
+        psi_1,         # (B_half, 2k) first half batch, stacked [u^(1), v^(1)]
+        psi_2,         # (B_half, 2k) second half batch, stacked [u^(2), v^(2)]
+        phi,           # (B, k)       per-sample phases (same row for same class)
+        vector_mask,   # (k,)
+        matrix_mask,   # (k, k)
+        operator_scale, # float: scale factor for operator term
     ):
         device = psi.device
         vector_mask = vector_mask.to(device)
@@ -275,27 +237,25 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         lam_1_re, lam_1_im = compute_complex_lambda_from_stacked(psi_1)
         lam_2_re, lam_2_im = compute_complex_lambda_from_stacked(psi_2)
 
-        # phase factors
-        cos_phi = torch.cos(phi)
-        sin_phi = torch.sin(phi)
+        # phase factors: phi is (B, k)
+        cos_phi = torch.cos(phi)   # (B, k)
+        sin_phi = torch.sin(phi)   # (B, k)
+        # batch-average cos(phi_i - phi_j) for the metric term
         cos_dphi = (
-            cos_phi[:, None] * cos_phi[None, :]
-            + sin_phi[:, None] * sin_phi[None, :]
-        )  # cos(phi_i - phi_j)
+            cos_phi[:, :, None] * cos_phi[:, None, :]
+            + sin_phi[:, :, None] * sin_phi[:, None, :]
+        ).mean(dim=0)  # (k, k)
 
         # ----- operator term -----
-        # <psi_i, Lpsi_i> = <u_i, Lu_i> + <v_i, Lv_i> + i(<u_i, Lv_i> - <v_i, Lu_i>)
-        ip_re = (u * Lu + v * Lv).sum(dim=0) / B
-        ip_im = (u * Lv - v * Lu).sum(dim=0) / B
+        # per-sample: Re(e^{i phi_{b,i}} * psi_{b,i}^* * Lpsi_{b,i})
+        contrib_re = u * Lu + v * Lv   # (B, k)
+        contrib_im = u * Lv - v * Lu   # (B, k)
 
         loss_operator = -2.0 * (
-            vector_mask * (cos_phi * ip_re - sin_phi * ip_im)
-        ).sum()
+            vector_mask[None, :] * (cos_phi * contrib_re - sin_phi * contrib_im)
+        ).sum() / (B * operator_scale)
 
         # ----- metric term -----
-        # |<psi_i, psi_j>|^2 = lam_re^2 + lam_im^2
-        # cross-batch symmetric estimator:
-        # Re(conj(lam_2) * lam_1) = lam_2_re * lam_1_re + lam_2_im * lam_1_im
         D = lam_2_re * lam_1_re + lam_2_im * lam_1_im
         base_D = matrix_mask * D
         loss_metric = (cos_dphi * base_D).sum()
@@ -311,7 +271,9 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         )
         ctx.B = B
         ctx.B_half = B_half
+        ctx.B_half_2 = psi_2.shape[0]
         ctx.k = k
+        ctx.operator_scale = operator_scale
         return loss
     
     @staticmethod
@@ -326,7 +288,9 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
 
         B = ctx.B
         B_half = ctx.B_half
+        B_half_2 = ctx.B_half_2
         k = ctx.k
+        operator_scale = ctx.operator_scale
         g = grad_output
 
         u, v = split_uv(psi)
@@ -335,84 +299,80 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         u1, v1 = split_uv(psi_1)
         u2, v2 = split_uv(psi_2)
 
-        cos_phi = torch.cos(phi)
-        sin_phi = torch.sin(phi)
+        # phi is (B, k)
+        cos_phi = torch.cos(phi)   # (B, k)
+        sin_phi = torch.sin(phi)   # (B, k)
         cos_dphi = (
-            cos_phi[:, None] * cos_phi[None, :]
-            + sin_phi[:, None] * sin_phi[None, :]
-        )
+            cos_phi[:, :, None] * cos_phi[:, None, :]
+            + sin_phi[:, :, None] * sin_phi[:, None, :]
+        ).mean(dim=0)  # (k, k)
 
         # -------------------------------------------------
-        # operator gradient wrt psi only
-        # loss_operator = -2 sum_i v_i Re(e^{i phi_i} <psi_i, Lpsi_i>)
+        # operator gradient wrt psi
         # -------------------------------------------------
-        fac_op = g * (-2.0 / B)
+        fac_op = g * (-2.0 / (B * operator_scale))
 
         grad_u = fac_op * (
-            vector_mask[None, :] * (cos_phi[None, :] * Lu - sin_phi[None, :] * Lv)
+            vector_mask[None, :] * (cos_phi * Lu - sin_phi * Lv)
         )
         grad_v = fac_op * (
-            vector_mask[None, :] * (sin_phi[None, :] * Lu + cos_phi[None, :] * Lv)
+            vector_mask[None, :] * (sin_phi * Lu + cos_phi * Lv)
         )
 
         grad_psi = torch.cat([grad_u, grad_v], dim=1)
 
         # -------------------------------------------------
         # metric gradient on half batches
-        # EXACT sign convention from your derivation:
-        #
-        # g_u =  (2/B_half)(Lambda_re u - Lambda_im v)
-        # g_v = -(2/B_half)(Lambda_re v + Lambda_im u)
-        #
-        # with opposite-half Lambda and with cos(phi_i - phi_j)*matrix_mask
         # -------------------------------------------------
-        fac_met = g * (2.0 / B_half)
+        fac_met_1 = g * (2.0 / B_half)
+        fac_met_2 = g * (2.0 / B_half_2)
         metric_mask = matrix_mask * cos_dphi
 
-        grad_u1 = fac_met * (
+        grad_u1 = fac_met_1 * (
             torch.einsum('lm,lm,bl->bm', metric_mask, lam_2_re, u1)
             - torch.einsum('lm,lm,bl->bm', metric_mask, lam_2_im, v1)
         )
-        grad_v1 = fac_met * (
-            - torch.einsum('lm,lm,bl->bm', metric_mask, lam_2_re, v1)
-            - torch.einsum('lm,lm,bl->bm', metric_mask, lam_2_im, u1)
+        grad_v1 = fac_met_1 * (
+            torch.einsum('lm,lm,bl->bm', metric_mask, lam_2_re, v1)
+            + torch.einsum('lm,lm,bl->bm', metric_mask, lam_2_im, u1)
         )
 
-        grad_u2 = fac_met * (
+        grad_u2 = fac_met_2 * (
             torch.einsum('lm,lm,bl->bm', metric_mask, lam_1_re, u2)
             - torch.einsum('lm,lm,bl->bm', metric_mask, lam_1_im, v2)
         )
-        grad_v2 = fac_met * (
-            - torch.einsum('lm,lm,bl->bm', metric_mask, lam_1_re, v2)
-            - torch.einsum('lm,lm,bl->bm', metric_mask, lam_1_im, u2)
+        grad_v2 = fac_met_2 * (
+            torch.einsum('lm,lm,bl->bm', metric_mask, lam_1_re, v2)
+            + torch.einsum('lm,lm,bl->bm', metric_mask, lam_1_im, u2)
         )
 
         grad_psi_1 = torch.cat([grad_u1, grad_v1], dim=1)
         grad_psi_2 = torch.cat([grad_u2, grad_v2], dim=1)
 
         # -------------------------------------------------
-        # phi gradient
+        # phi gradient (B, k)
         # -------------------------------------------------
-        # operator contribution
-        ip_re = (u * Lu + v * Lv).sum(dim=0) / B
-        ip_im = (u * Lv - v * Lu).sum(dim=0) / B
+        # operator contribution: d/d(phi_{b,i}) of per-sample operator term
+        contrib_re = u * Lu + v * Lv   # (B, k)
+        contrib_im = u * Lv - v * Lu   # (B, k)
 
-        grad_phi_op = g * 2.0 * vector_mask * (
-            sin_phi * ip_re + cos_phi * ip_im
+        grad_phi_op = g * (2.0 / (B * operator_scale)) * vector_mask[None, :] * (
+            sin_phi * contrib_re + cos_phi * contrib_im
+        )  # (B, k)
+
+        # metric contribution: d/d(phi_{b,i}) of batch-averaged cos_dphi
+        # = -(1/B) * [sum_m base_D[i,m]*sin(phi_{b,i}-phi_{b,m}) + sum_l base_D[l,i]*sin(phi_{b,i}-phi_{b,l})]
+        sin_dphi_b = (
+            sin_phi[:, :, None] * cos_phi[:, None, :]
+            - cos_phi[:, :, None] * sin_phi[:, None, :]
+        )  # (B, k, k),  sin_dphi_b[b,i,j] = sin(phi_{b,i} - phi_{b,j})
+
+        grad_phi_metric = -(g / B) * (
+            (base_D[None, :, :] * sin_dphi_b).sum(dim=2)      # (B, k): sum over j
+            + (base_D.T[None, :, :] * sin_dphi_b).sum(dim=2)  # (B, k): sum over l via transpose
         )
 
-        # metric contribution
-        sin_dphi = (
-            sin_phi[:, None] * cos_phi[None, :]
-            - cos_phi[:, None] * sin_phi[None, :]
-        )  # sin(phi_i - phi_j)
-
-        grad_phi_metric = g * (
-            -(base_D * sin_dphi).sum(dim=1)
-            + (base_D * sin_dphi).sum(dim=0)
-        )
-
-        grad_phi = grad_phi_op + grad_phi_metric
+        grad_phi = grad_phi_op + grad_phi_metric  # (B, k)
 
         return (
             grad_psi,    # psi
@@ -422,157 +382,8 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
             grad_phi,    # phi
             None,        # vector_mask
             None,        # matrix_mask
+            None,        # operator_scale
         )
-
-# class NestedLoRALossFunctionEVD(torch.autograd.Function):
-#     """
-#     Custom autograd function implementing the NestedLoRA / Neural SVD metric loss
-#     for complex eigenfunctions with learnable eigenvalue phases.
-
-#     Nesting type: sequential  (m_ell = 1, M_{i,ell} = 1[i <= ell])
-#     The nesting matrix M_seq is built by get_sequential_nesting_masks().
-
-#     Inputs
-#     ------
-#     psi_re, psi_im     : (B, k)    full batch — operator term only
-#     Lpsi_re, Lpsi_im   : (B, k)    Koopman-operator output via JVP — operator term only
-#     psi_A_re, psi_A_im : (B/2, k)  first half — metric term (f1 in NeuralSVD)
-#     psi_B_re, psi_B_im : (B/2, k)  second half — metric term (f2 in NeuralSVD)
-#     cos_phi, sin_phi      : (k,)      learned eigenvalue phases
-#     operator_scale        : float     divides loss_operator to balance against loss_metric
-
-#     Output
-#     ------
-#     loss = loss_operator + loss_metric
-#       loss_operator = (−2/scale) · Σ_m Re(e^{iφ_m} · ⟨ψ_m, Lψ_m⟩)   (full batch)
-#       loss_metric   = Σ_{i,ell} matrix_mask[i,ell] · Re(conj(Λ_B[i,ell]) · Λ_A[i,ell])
-#     where matrix_mask[i,ell] = M_seq[i,ell] · cos(φ_i − φ_ell)
-#     """
-
-#     @staticmethod
-#     def forward(ctx, psi_re, psi_im, Lpsi_re, Lpsi_im,
-#                 psi_A_re, psi_A_im, psi_B_re, psi_B_im,
-#                 phi, operator_scale, vector_mask, matrix_mask):
-#         B, k = psi_re.shape
-#         B_half, _ = psi_A_re.shape
-#         dev = psi_re.device
-
-#         vector_mask = vector_mask.to(dev)
-#         matrix_mask = matrix_mask.to(dev)
-
-#         cos_phi = torch.cos(phi)
-#         sin_phi = torch.sin(phi)
-
-#         # Complex Gram matrices from the two independent minibatches
-#         lam_1_re, lam_1_im = compute_complex_lambda(psi_A_re, psi_A_im)
-#         lam_2_re, lam_2_im = compute_complex_lambda(psi_B_re, psi_B_im)
-
-#         # cos(phi_i - phi_j)
-#         cos_dphi = (
-#             cos_phi[:, None] * cos_phi[None, :]
-#             + sin_phi[:, None] * sin_phi[None, :]
-#         )
-
-#         # phase-adjusted metric mask
-#         metric_mask = matrix_mask * cos_dphi
-
-#         # Re(conj(Lambda_2) * Lambda_1)
-#         D = lam_2_re * lam_1_re + lam_2_im * lam_1_im
-
-#         loss_metric = (metric_mask * D).sum()
-
-#         # full-batch inner products for operator term
-#         ip_re = (psi_re * Lpsi_re + psi_im * Lpsi_im).sum(0) / B
-#         ip_im = (-psi_im * Lpsi_re + psi_re * Lpsi_im).sum(0) / B
-
-#         loss_operator = -2.0 * (
-#             vector_mask * (cos_phi * ip_re - sin_phi * ip_im)
-#         ).sum() / operator_scale
-
-#         loss = loss_operator + loss_metric
-
-#         # save what backward actually needs
-#         ctx.save_for_backward(
-#             psi_re, psi_im, Lpsi_re, Lpsi_im,
-#             psi_A_re, psi_A_im, psi_B_re, psi_B_im,
-#             phi,
-#             vector_mask, matrix_mask,
-#             lam_2_re, lam_2_im,
-#             ip_re, ip_im,
-#         )
-#         ctx.operator_scale = operator_scale
-#         ctx.B = B
-#         ctx.B_half = B_half
-#         return loss
-
-#     @staticmethod
-#     def backward(ctx, grad_output):
-#         (psi_re, psi_im, Lpsi_re, Lpsi_im,
-#          psi_A_re, psi_A_im, psi_B_re, psi_B_im,
-#          cos_phi, sin_phi,
-#          lam_2_re, lam_2_im, matrix_mask,
-#          M_seq_D, ip_re, ip_im) = ctx.saved_tensors
-#         scale  = ctx.operator_scale
-#         B      = ctx.B
-#         B_half = ctx.B_half
-#         g = grad_output
-
-#         # ── Metric gradients (A/B halves only; no operator contribution here)
-#         lam_1_re, lam_1_im = compute_complex_lambda(psi_A_re, psi_A_im)  # recompute; psi_A is saved
-#         # Differentiating loss_metric = Σ_{ij} M[i,j]·D[i,j] w.r.t. psi_A[b,m] yields two
-#         # chain-rule terms: one where i=m (row) and one where j=m (col).  Together they give
-#         # (1/B_half) Σ_j (M[m,j] + M[j,m]) · Λ_2[m,j] · ψ_A[b,j].
-#         # struct_mask is upper-triangular (not symmetric), so M[m,j] ≠ M[j,m] and the correct
-#         # weight is M + M^T, not 2·M.  The old factor of 2 only holds for a symmetric mask.
-#         sym_mask = matrix_mask + matrix_mask.T   # (k,k) symmetric
-#         fac_met = g / B_half
-#         grad_psi_A_re = fac_met * (
-#             torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_re, psi_A_re)
-#           - torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_im, psi_A_im)
-#         )
-#         grad_psi_A_im = fac_met * (
-#             torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_re, psi_A_im)
-#           + torch.einsum('lm,lm,bl->bm', sym_mask, lam_2_im, psi_A_re)
-#         )
-#         grad_psi_B_re = fac_met * (
-#             torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_re, psi_B_re)
-#           - torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_im, psi_B_im)
-#         )
-#         grad_psi_B_im = fac_met * (
-#             torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_re, psi_B_im)
-#           + torch.einsum('lm,lm,bl->bm', sym_mask, lam_1_im, psi_B_re)
-#         )
-
-#         # ── Operator gradients (full batch; no metric contribution here)
-#         fac_op = g * (-2.0) / (scale * B)
-#         grad_psi_re  = fac_op * (cos_phi * Lpsi_re  - sin_phi * Lpsi_im)
-#         grad_psi_im  = fac_op * (cos_phi * Lpsi_im  + sin_phi * Lpsi_re)
-#         grad_Lpsi_re = fac_op * (cos_phi * psi_re   + sin_phi * psi_im)
-#         grad_Lpsi_im = fac_op * (cos_phi * psi_im   - sin_phi * psi_re)
-
-#         # ── Phase gradients
-#         # From loss_operator: ∂/∂cos_φ_m = (−2/scale)·ip_re[m]  (ip from full batch)
-#         grad_cos_phi = g * (-2.0 / scale) * ip_re
-#         grad_sin_phi = g * ( 2.0 / scale) * ip_im
-#         # From loss_metric: ∂/∂cos_φ_q = (M_seq_D @ cos_φ + M_seq_D.T @ cos_φ)[q]
-#         grad_cos_phi = grad_cos_phi + g * (M_seq_D @ cos_phi + M_seq_D.T @ cos_phi)
-#         grad_sin_phi = grad_sin_phi + g * (M_seq_D @ sin_phi + M_seq_D.T @ sin_phi)
-
-#         return (
-#             grad_psi_re,    # psi_re   — operator gradient (full batch)
-#             grad_psi_im,    # psi_im   — operator gradient (full batch)
-#             grad_Lpsi_re,   # Lpsi_re  — flows back through JVP (full batch)
-#             grad_Lpsi_im,   # Lpsi_im  — flows back through JVP (full batch)
-#             grad_psi_A_re,  # psi_A_re — metric gradient (half batch)
-#             grad_psi_A_im,  # psi_A_im — metric gradient (half batch)
-#             grad_psi_B_re,  # psi_B_re — metric gradient (half batch)
-#             grad_psi_B_im,  # psi_B_im — metric gradient (half batch)
-#             grad_cos_phi,   # cos_phi — learned phase
-#             grad_sin_phi,   # sin_phi — learned phase
-#             None,           # operator_scale
-#             None,           # struct_mask
-#         )
-
 
 #----------------------------------------------------------------------------
 # Loss from equation (4) of Jon's writeup
@@ -623,42 +434,6 @@ class KoopmanLoss:
         with torch.no_grad():
             xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, sigma_data=self.sigma_data)
 
-        # if not getattr(self, '_debug_saved', False) and torch.distributed.get_rank() == 0:
-        #     small_t_mask = (t.squeeze() < 0.1)
-        #     if small_t_mask.any():
-        #         import os, math
-        #         import PIL.Image
-        #         import numpy as np
-        #         save_dir = 'images/cfm_dxdt_small_t'
-        #         os.makedirs(save_dir, exist_ok=True)
-        #         idx = small_t_mask.nonzero(as_tuple=True)[0]
-
-        #         def make_grid_np(tensor):
-        #             # tensor: (N, C, H, W), normalize to [0, 255]
-        #             t = tensor.cpu().float()
-        #             t = (t - t.min()) / (t.max() - t.min() + 1e-8)
-        #             t = (t * 255).clamp(0, 255).to(torch.uint8)
-        #             N, C, H, W = t.shape
-        #             ncols = math.ceil(math.sqrt(N))
-        #             nrows = math.ceil(N / ncols)
-        #             grid = np.zeros((nrows * H, ncols * W, C), dtype=np.uint8)
-        #             for i, img in enumerate(t):
-        #                 r, c = divmod(i, ncols)
-        #                 grid[r*H:(r+1)*H, c*W:(c+1)*W] = img.permute(1, 2, 0).numpy()
-        #             return grid.squeeze(-1) if C == 1 else grid
-
-        #         t_vals = t[idx].squeeze().cpu().tolist()
-        #         if isinstance(t_vals, float):
-        #             t_vals = [t_vals]
-        #         print(f'[cfm_dxdt debug] t values: {[f"{v:.4f}" for v in t_vals]}')
-
-        #         x_np = make_grid_np(x[idx])
-        #         xdot_np = make_grid_np(xdot[idx])
-        #         mode = 'L' if x_np.ndim == 2 else 'RGB'
-        #         PIL.Image.fromarray(x_np, mode).save(os.path.join(save_dir, 'x.png'))
-        #         PIL.Image.fromarray(xdot_np, mode).save(os.path.join(save_dir, 'xdot.png'))
-        #         self._debug_saved = True
-
         tdot = torch.ones_like(t)  # dt/ds = 1 in the time-augmented system
 
         # ------------------------------------------------------------
@@ -684,10 +459,9 @@ class KoopmanLoss:
         training_stats.report('Loss/psi_rms',  (psi_re**2  + psi_im**2).mean().sqrt())
         training_stats.report('Loss/Lpsi_rms', (Lpsi_re**2 + Lpsi_im**2).mean().sqrt())
 
-        # phase_net ignores t, the arg is a placeholder
-        phi = phase_net(t)               # (k,)
-        cos_phi = torch.cos(phi)
-        sin_phi = torch.sin(phi)
+        phi = phase_net(labels)          # (B, k)
+        cos_phi = torch.cos(phi)         # (B, k)
+        sin_phi = torch.sin(phi)         # (B, k)
 
         # ------------------------------------------------------------
         # Operator term: full batch  (paper: use all of f, Tf)
@@ -714,20 +488,26 @@ class KoopmanLoss:
         vector_mask, matrix_mask = get_sequential_nesting_masks(k, device=psi_re.device)
 
         loss_svd = ComplexNestedMetricOpLoss.apply(
-            psi,          # (B, 2k)
-            Lpsi,         # (B, 2k)
-            psi_1,        # (B/2, 2k)
-            psi_2,        # (B/2, 2k)
-            phi,            # (k,)
-            vector_mask,  # (k,)
-            matrix_mask,  # (k, k)
+            psi,                    # (B, 2k)
+            Lpsi,                   # (B, 2k)
+            psi_1,                  # (B/2, 2k)
+            psi_2,                  # (B/2, 2k)
+            phi,                    # (B, k)
+            vector_mask,            # (k,)
+            matrix_mask,            # (k, k)
+            self.operator_scale,    # float
         )
 
         # Logging: detached estimates (operator from full batch, metric = total - operator).
         ip_re_log = ip_re.detach()
         ip_im_log = ip_im.detach()
         with torch.no_grad():
-            loss_operator_log = -2.0 * (cos_phi * ip_re - sin_phi * ip_im).sum() / self.operator_scale
+            # operator term uses per-sample phi (B,k) and per-sample contributions (B,k)
+            contrib_re_log = psi_re.detach() * Lpsi_re.detach() + psi_im.detach() * Lpsi_im.detach()
+            contrib_im_log = psi_re.detach() * Lpsi_im.detach() - psi_im.detach() * Lpsi_re.detach()
+            loss_operator_log = -2.0 * (
+                cos_phi.detach() * contrib_re_log - sin_phi.detach() * contrib_im_log
+            ).sum() / (B * self.operator_scale)
             loss_metric_log   = loss_svd.detach() - loss_operator_log
 
         # Decompose Lpsi into time and spatial parts — the only genuinely new computation.
@@ -748,9 +528,9 @@ class KoopmanLoss:
         # (G) Eigenvalue magnitude stats  (use full non-detached psi)
         # λ_i = e^{iφ_i} * ||ψ_i||²  →  |λ_i| = ||ψ_i||²
         # ------------------------------------------------------------
-        psi_sq      = (psi_re**2 + psi_im**2).mean(dim=0)   # (k,)
-        lam_re_vals = cos_phi * psi_sq
-        lam_im_vals = sin_phi * psi_sq
+        psi_sq      = (psi_re**2 + psi_im**2).mean(dim=0)      # (k,)
+        lam_re_vals = cos_phi.mean(dim=0) * psi_sq             # (k,)
+        lam_im_vals = sin_phi.mean(dim=0) * psi_sq             # (k,)
         lam_mag     = psi_sq
 
         training_stats.report('Eigenvalues/lam_mag_min',  lam_mag.min())

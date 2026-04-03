@@ -139,7 +139,7 @@ def koopman_training_loop(
     #             param.data.mul_(0.01)
     #             dist.print0(f'Scaled down: {name}')
 
-    phase_net = dnnlib.util.construct_class_by_name(**phase_kwargs)  # expects k inside kwargs or class default
+    phase_net = dnnlib.util.construct_class_by_name(**phase_kwargs, label_dim=interface_kwargs['label_dim'])
     phase_net.train().requires_grad_(True).to(device)
 
     # Optional: print summary for psi_net.
