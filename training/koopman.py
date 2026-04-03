@@ -17,8 +17,8 @@ def trigflow_alpha_s(t):
     s = torch.sin(t)
     return alpha, s
 
-def cfm_dxdt_from_net(net, x, t, labels=None, sigma_data: float = 0.5):
-    x0_hat = net(x, t, labels)
+def cfm_dxdt_from_net(net, x, t, labels=None, augment_labels=None, sigma_data: float = 0.5):
+    x0_hat = net(x, t, labels, augment_labels=augment_labels)
     alpha = torch.cos(t)
     s = torch.sin(t).clamp(min=1e-6)
     return (alpha * x - x0_hat) / s
@@ -247,18 +247,21 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         ).mean(dim=0)  # (k, k)
 
         # ----- operator term -----
-        # per-sample: Re(e^{i phi_{b,i}} * psi_{b,i}^* * Lpsi_{b,i})
-        contrib_re = u * Lu + v * Lv   # (B, k)
-        contrib_im = u * Lv - v * Lu   # (B, k)
+        # per-sample: Re(e^{-i phi_{b,i}} * psi_{b,i}^* * Lpsi_{b,i})
+        # Eigenfunction eq: Lpsi = e^{i phi} psi
+        # Residual ||Lpsi - e^{i phi} psi||^2 expands to -2 Re(e^{-i phi} <psi, Lpsi>) + ...
+        # Re(e^{-i phi} z) = cos(phi)*Re(z) + sin(phi)*Im(z)
+        contrib_re = u * Lu + v * Lv   # (B, k)  = Re(<psi, Lpsi>)
+        contrib_im = u * Lv - v * Lu   # (B, k)  = Im(<psi, Lpsi>)
 
         loss_operator = -2.0 * (
-            vector_mask[None, :] * (cos_phi * contrib_re - sin_phi * contrib_im)
+            cos_phi * contrib_re + sin_phi * contrib_im
         ).sum() / (B * operator_scale)
 
         # ----- metric term -----
         D = lam_2_re * lam_1_re + lam_2_im * lam_1_im
-        base_D = matrix_mask * D
-        loss_metric = (cos_dphi * base_D).sum()
+        base_D = matrix_mask * D  # saved for backward; not used in loss scalar
+        loss_metric = (cos_dphi * D).sum()
 
         loss = loss_operator + loss_metric
 
@@ -313,10 +316,10 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         fac_op = g * (-2.0 / (B * operator_scale))
 
         grad_u = fac_op * (
-            vector_mask[None, :] * (cos_phi * Lu - sin_phi * Lv)
+            vector_mask[None, :] * (cos_phi * Lu + sin_phi * Lv)
         )
         grad_v = fac_op * (
-            vector_mask[None, :] * (sin_phi * Lu + cos_phi * Lv)
+            vector_mask[None, :] * (cos_phi * Lv - sin_phi * Lu)
         )
 
         grad_psi = torch.cat([grad_u, grad_v], dim=1)
@@ -357,7 +360,7 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         contrib_im = u * Lv - v * Lu   # (B, k)
 
         grad_phi_op = g * (2.0 / (B * operator_scale)) * vector_mask[None, :] * (
-            sin_phi * contrib_re + cos_phi * contrib_im
+            sin_phi * contrib_re - cos_phi * contrib_im
         )  # (B, k)
 
         # metric contribution: d/d(phi_{b,i}) of batch-averaged cos_dphi
@@ -432,7 +435,7 @@ class KoopmanLoss:
         # (B) Vector field for time-augmented dynamics: (xdot, 1)
         # ------------------------------------------------------------
         with torch.no_grad():
-            xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, sigma_data=self.sigma_data)
+            xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, augment_labels=augment_labels, sigma_data=self.sigma_data)
 
         tdot = torch.ones_like(t)  # dt/ds = 1 in the time-augmented system
 
@@ -506,7 +509,7 @@ class KoopmanLoss:
             contrib_re_log = psi_re.detach() * Lpsi_re.detach() + psi_im.detach() * Lpsi_im.detach()
             contrib_im_log = psi_re.detach() * Lpsi_im.detach() - psi_im.detach() * Lpsi_re.detach()
             loss_operator_log = -2.0 * (
-                cos_phi.detach() * contrib_re_log - sin_phi.detach() * contrib_im_log
+                cos_phi.detach() * contrib_re_log + sin_phi.detach() * contrib_im_log
             ).sum() / (B * self.operator_scale)
             loss_metric_log   = loss_svd.detach() - loss_operator_log
 
