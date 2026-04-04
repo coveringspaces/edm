@@ -247,20 +247,15 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         ).mean(dim=0)  # (k, k)
 
         # ----- operator term -----
-        # per-sample: Re(e^{-i phi_{b,i}} * psi_{b,i}^* * Lpsi_{b,i})
-        # Eigenfunction eq: Lpsi = e^{i phi} psi
-        # Residual ||Lpsi - e^{i phi} psi||^2 expands to -2 Re(e^{-i phi} <psi, Lpsi>) + ...
-        # Re(e^{-i phi} z) = cos(phi)*Re(z) + sin(phi)*Im(z)
-        contrib_re = u * Lu + v * Lv   # (B, k)  = Re(<psi, Lpsi>)
+        # per-sample: Re(e^{+i phi_{b,i}} * conj(psi_{b,i}) * Lpsi_{b,i})
+        # = cos(phi)*Re(conj(psi)*Lpsi) - sin(phi)*Im(conj(psi)*Lpsi)
+        contrib_re = u * Lu + v * Lv   # (B, k)  = Re(conj(psi)*Lpsi)
         contrib_im = u * Lv - v * Lu   # (B, k)  = Im(<psi, Lpsi>)
 
-        loss_operator = -2.0 * (
-            cos_phi * contrib_re + sin_phi * contrib_im
-        ).sum() / (B * operator_scale)
+        loss_operator = -2.0 * (cos_phi * contrib_re - sin_phi * contrib_im).sum() / (B * operator_scale)
 
         # ----- metric term -----
         D = lam_2_re * lam_1_re + lam_2_im * lam_1_im
-        base_D = matrix_mask * D  # saved for backward; not used in loss scalar
         loss_metric = (cos_dphi * D).sum()
 
         loss = loss_operator + loss_metric
@@ -270,7 +265,6 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
             phi, vector_mask, matrix_mask,
             lam_1_re, lam_1_im,
             lam_2_re, lam_2_im,
-            base_D,
         )
         ctx.B = B
         ctx.B_half = B_half
@@ -286,13 +280,11 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
             phi, vector_mask, matrix_mask,
             lam_1_re, lam_1_im,
             lam_2_re, lam_2_im,
-            base_D,
         ) = ctx.saved_tensors
 
         B = ctx.B
         B_half = ctx.B_half
         B_half_2 = ctx.B_half_2
-        k = ctx.k
         operator_scale = ctx.operator_scale
         g = grad_output
 
@@ -316,10 +308,10 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         fac_op = g * (-2.0 / (B * operator_scale))
 
         grad_u = fac_op * (
-            vector_mask[None, :] * (cos_phi * Lu + sin_phi * Lv)
+            vector_mask[None, :] * (cos_phi * Lu - sin_phi * Lv)
         )
         grad_v = fac_op * (
-            vector_mask[None, :] * (cos_phi * Lv - sin_phi * Lu)
+            vector_mask[None, :] * (cos_phi * Lv + sin_phi * Lu)
         )
 
         grad_psi = torch.cat([grad_u, grad_v], dim=1)
@@ -360,7 +352,7 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
         contrib_im = u * Lv - v * Lu   # (B, k)
 
         grad_phi_op = g * (2.0 / (B * operator_scale)) * vector_mask[None, :] * (
-            sin_phi * contrib_re - cos_phi * contrib_im
+            sin_phi * contrib_re + cos_phi * contrib_im
         )  # (B, k)
 
         # metric contribution: d/d(phi_{b,i}) of batch-averaged cos_dphi
@@ -370,10 +362,8 @@ class ComplexNestedMetricOpLoss(torch.autograd.Function):
             - cos_phi[:, :, None] * sin_phi[:, None, :]
         )  # (B, k, k),  sin_dphi_b[b,i,j] = sin(phi_{b,i} - phi_{b,j})
 
-        grad_phi_metric = -(g / B) * (
-            (base_D[None, :, :] * sin_dphi_b).sum(dim=2)      # (B, k): sum over j
-            + (base_D.T[None, :, :] * sin_dphi_b).sum(dim=2)  # (B, k): sum over l via transpose
-        )
+        D_full = lam_2_re * lam_1_re + lam_2_im * lam_1_im   # (k, k)
+        grad_phi_metric = -(g * 2.0 / B) * ((matrix_mask * D_full)[None, :, :] * sin_dphi_b).sum(dim=2)
 
         grad_phi = grad_phi_op + grad_phi_metric  # (B, k)
 
@@ -509,7 +499,7 @@ class KoopmanLoss:
             contrib_re_log = psi_re.detach() * Lpsi_re.detach() + psi_im.detach() * Lpsi_im.detach()
             contrib_im_log = psi_re.detach() * Lpsi_im.detach() - psi_im.detach() * Lpsi_re.detach()
             loss_operator_log = -2.0 * (
-                cos_phi.detach() * contrib_re_log + sin_phi.detach() * contrib_im_log
+                cos_phi.detach() * contrib_re_log - sin_phi.detach() * contrib_im_log
             ).sum() / (B * self.operator_scale)
             loss_metric_log   = loss_svd.detach() - loss_operator_log
 
