@@ -23,6 +23,71 @@ def cfm_dxdt_from_net(net, x, t, labels=None, augment_labels=None, sigma_data: f
     s = torch.sin(t).clamp(min=1e-6)
     return (alpha * x - x0_hat) / s
 
+# ─────────────────────────────────────────────────────────────────────────────
+# QPSK toy-distribution helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sample_qpsk_toy(B, m=1.0, device='cpu'):
+    """(B, 2) clean samples from the 4-point QPSK distribution {±m}².
+    Each coordinate is i.i.d. uniform over {-m, +m}.
+    """
+    signs = torch.randint(0, 2, (B, 2), device=device).to(torch.float32) * 2.0 - 1.0
+    return signs * m  # (B, 2)
+
+
+def qpsk_closed_form_dxdt(x, t, sigma_data=0.5, m=1.0):
+    """Analytic velocity field for QPSK on the TrigFlow curve.
+
+    Derivation: for each coordinate i independently, the prior is
+      P(y_i = +m) = P(y_i = -m) = 1/2
+    and the noisy observation is x_i = alpha*y_i + s*sigma_data*eps_i.
+    The posterior mean works out to:
+      E[y_i | x_i] = m * tanh(alpha * m * x_i / (s^2 * sigma_data^2))
+    The TrigFlow velocity is then (alpha*x - E[y|x]) / s,
+    matching cfm_dxdt_from_net with x0_hat = E[y|x].
+
+    x:           (B, 2)
+    t:           (B, 1)  — t in [0, pi/2]
+    returns:     (B, 2)
+    """
+    alpha = torch.cos(t)                         # (B, 1)
+    s     = torch.sin(t).clamp(min=1e-6)         # (B, 1)
+    posterior_mean = m * torch.tanh(alpha * m * x / (s**2 * sigma_data**2))
+    return (alpha * x - posterior_mean) / s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Toy MLP psi-network for 2D inputs
+# ─────────────────────────────────────────────────────────────────────────────
+
+@persistence.persistent_class
+class KoopmanToyMLP(nn.Module):
+    """Lightweight MLP psi-network for 2D toy experiments.
+
+    Input:  x ∈ R² concatenated with t ∈ R  →  (B, 3)
+    Output: (B, 2k) real values representing k complex eigenfunctions,
+            packed as [re_1…re_k | im_1…im_k] to match split_reim().
+    """
+    def __init__(self, k, hidden_dim=256, n_hidden=3,
+                 label_dim=0, augment_dim=0, use_fp16=False, sigma_data=0.5,
+                 img_resolution=None, img_channels=None, **unused_kwargs):
+        super().__init__()
+        self.k         = k
+        self.label_dim = label_dim   # kept for API compat with training loop; toy is unconditional
+
+        layers = [nn.Linear(3, hidden_dim), nn.SiLU()]
+        for _ in range(n_hidden - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU()]
+        layers.append(nn.Linear(hidden_dim, 2 * k))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x, t, class_labels=None, force_fp32=False, augment_labels=None):
+        """x: (B, 2),  t: broadcastable to (B, 1).  Returns (B, 2k)."""
+        x = x.to(torch.float32)
+        t = t.to(torch.float32).reshape(x.shape[0], 1)   # ensure (B, 1)
+        return self.net(torch.cat([x, t], dim=-1))
+
+
 #----------------------------------------------------------------------------
 # DhariwalEncoderOnly steals the mapping + encoder from DhariwalUNet, but does NOT have a decoder.
 
@@ -386,7 +451,8 @@ class KoopmanLoss:
     def __init__(self,
                  P_mean=-1.2, P_std=1.2, sigma_data=0.5,
                  sigma_min=1e-3, sigma_max=80, t_epsilon=1e-4,
-                 operator_scale=100.0):
+                 operator_scale=100.0,
+                 toy_mode=False, toy_m=1.0):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -394,6 +460,8 @@ class KoopmanLoss:
         self.sigma_max = sigma_max
         self.t_epsilon = t_epsilon
         self.operator_scale = operator_scale
+        self.toy_mode = toy_mode
+        self.toy_m = toy_m
 
         # torch.func.jvp exists in torch>=2.0
         try:
@@ -405,35 +473,55 @@ class KoopmanLoss:
     def __call__(self, psi_net, phase_net, cfm_net, images, labels=None, augment_pipe=None):
         assert self._jvp is not None, "Need torch.func.jvp (PyTorch 2.x)."
 
-        # ------------------------------------------------------------
-        # (A) Sample (x,t) on the TrigFlow curve 
-        # ------------------------------------------------------------
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        if self.toy_mode:
+            # ----------------------------------------------------------------
+            # (A+B) QPSK toy path: analytic data + analytic vector field
+            # ----------------------------------------------------------------
+            B      = images.shape[0]
+            device = images.device
+            y      = sample_qpsk_toy(B, m=self.toy_m, device=device)        # (B, 2)
 
-        rnd_normal = torch.randn([y.shape[0], 1, 1, 1], device=y.device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp().clamp(self.sigma_min, self.sigma_max)
+            rnd_normal = torch.randn([B, 1], device=device)
+            sigma = (rnd_normal * self.P_std + self.P_mean).exp().clamp(self.sigma_min, self.sigma_max)
+            t     = torch.atan(sigma / self.sigma_data)
+            t     = t.clamp(min=self.t_epsilon, max=0.5 * torch.pi - self.t_epsilon)
+            alpha = torch.cos(t)
+            s     = torch.sin(t)
+            eps   = torch.randn_like(y)
+            x     = alpha * y + s * self.sigma_data * eps                    # (B, 2)
 
-        t = torch.atan(sigma / self.sigma_data)
-        t = t.clamp(min=self.t_epsilon, max=0.5 * torch.pi - self.t_epsilon)
+            xdot  = qpsk_closed_form_dxdt(x, t, sigma_data=self.sigma_data, m=self.toy_m)
+            tdot  = torch.ones_like(t)
+            labels         = None
+            augment_labels = None
+        else:
+            # ----------------------------------------------------------------
+            # (A) Sample (x,t) on the TrigFlow curve
+            # ----------------------------------------------------------------
+            y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
 
-        alpha = torch.cos(t)
-        s = torch.sin(t)
-        eps = torch.randn_like(y)
-        x = alpha * y + s * self.sigma_data * eps
+            rnd_normal = torch.randn([y.shape[0], 1, 1, 1], device=y.device)
+            sigma = (rnd_normal * self.P_std + self.P_mean).exp().clamp(self.sigma_min, self.sigma_max)
+            t     = torch.atan(sigma / self.sigma_data)
+            t     = t.clamp(min=self.t_epsilon, max=0.5 * torch.pi - self.t_epsilon)
+            alpha = torch.cos(t)
+            s     = torch.sin(t)
+            eps   = torch.randn_like(y)
+            x     = alpha * y + s * self.sigma_data * eps
 
-        # ------------------------------------------------------------
-        # (B) Vector field for time-augmented dynamics: (xdot, 1)
-        # ------------------------------------------------------------
-        with torch.no_grad():
-            xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, augment_labels=augment_labels, sigma_data=self.sigma_data)
+            # ----------------------------------------------------------------
+            # (B) Vector field for time-augmented dynamics: (xdot, 1)
+            # ----------------------------------------------------------------
+            with torch.no_grad():
+                xdot = cfm_dxdt_from_net(cfm_net, x, t, labels=labels, augment_labels=augment_labels, sigma_data=self.sigma_data)
 
-        tdot = torch.ones_like(t)  # dt/ds = 1 in the time-augmented system
+            tdot = torch.ones_like(t)  # dt/ds = 1 in the time-augmented system
 
         # ------------------------------------------------------------
         # (C) One JVP: (psi, Lpsi) where Lpsi = ∂t psi + ∇x psi · xdot
         # ------------------------------------------------------------
         raw_psi_net = psi_net
-        
+
         def f(x_in, t_in):
             # labels & augment_labels treated as constants (no grads through them)
             out = raw_psi_net(x_in, t_in, class_labels=labels, augment_labels=augment_labels, force_fp32=True)  # (B,2k)
@@ -452,7 +540,9 @@ class KoopmanLoss:
         training_stats.report('Loss/psi_rms',  (psi_re**2  + psi_im**2).mean().sqrt())
         training_stats.report('Loss/Lpsi_rms', (Lpsi_re**2 + Lpsi_im**2).mean().sqrt())
 
-        phi = phase_net(labels)          # (B, k)
+        phi = phase_net(labels)          # (B, k) or (k,) when unconditional
+        if phi.dim() == 1:
+            phi = phi.unsqueeze(0).expand(B, -1)   # (1, k) -> (B, k), grads sum over batch
         cos_phi = torch.cos(phi)         # (B, k)
         sin_phi = torch.sin(phi)         # (B, k)
 
@@ -539,10 +629,3 @@ class KoopmanLoss:
         self._last_lam_mag = lam_mag.detach()
 
         return loss_svd
-
-
-
-
-
-
-

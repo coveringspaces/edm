@@ -18,6 +18,7 @@ def koopman_training_loop(
     run_dir             = '.',      # Output directory.
     dataset_kwargs      = {},       # Options for training set.
     data_loader_kwargs  = {},       # Options for torch.utils.data.DataLoader.
+    toy_qpsk            = False,    # If True: skip dataset/CFM, use 2D QPSK toy mode.
 
     # --- Koopman pieces (trainable) ---
     psi_network_kwargs  = {},       # construct_class_by_name(...) for KoopmanEigenNet
@@ -76,68 +77,71 @@ def koopman_training_loop(
     assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()
 
     # ------------------------------------------------------------------------
-    # Load dataset.
+    # Load dataset  (skipped in toy_qpsk mode).
     # ------------------------------------------------------------------------
-    dist.print0('Loading dataset...')
-    dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
-    dataset_sampler = misc.InfiniteSampler(
-        dataset=dataset_obj,
-        rank=dist.get_rank(),
-        num_replicas=dist.get_world_size(),
-        seed=seed
-    )
-    dataset_iterator = iter(torch.utils.data.DataLoader(
-        dataset=dataset_obj,
-        sampler=dataset_sampler,
-        batch_size=batch_gpu,
-        **data_loader_kwargs
-    ))
-
-    interface_kwargs = dict(
-    img_resolution=dataset_obj.resolution,
-    img_channels=dataset_obj.num_channels,
-    label_dim=dataset_obj.label_dim,
-    )
+    if not toy_qpsk:
+        dist.print0('Loading dataset...')
+        dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
+        dataset_sampler = misc.InfiniteSampler(
+            dataset=dataset_obj,
+            rank=dist.get_rank(),
+            num_replicas=dist.get_world_size(),
+            seed=seed
+        )
+        dataset_iterator = iter(torch.utils.data.DataLoader(
+            dataset=dataset_obj,
+            sampler=dataset_sampler,
+            batch_size=batch_gpu,
+            **data_loader_kwargs
+        ))
+        interface_kwargs = dict(
+            img_resolution=dataset_obj.resolution,
+            img_channels=dataset_obj.num_channels,
+            label_dim=dataset_obj.label_dim,
+        )
+    else:
+        dist.print0('Toy QPSK mode: skipping dataset load.')
+        dataset_iterator = None
+        interface_kwargs = dict(label_dim=0)   # toy is unconditional; no image dims needed
 
     # ------------------------------------------------------------------------
     # Load frozen CFM net (vector field provider) directly from snapshot.
+    # (skipped in toy_qpsk mode — analytic vector field is used instead)
     # ------------------------------------------------------------------------
-    dist.print0('Loading frozen CFM network from snapshot...')
+    if not toy_qpsk:
+        dist.print0('Loading frozen CFM network from snapshot...')
 
-    assert cfm_resume_pkl is not None, "Need --cfm-pkl to provide a frozen teacher."
+        assert cfm_resume_pkl is not None, "Need --cfm-pkl to provide a frozen teacher."
 
-    if dist.get_rank() != 0:
-        torch.distributed.barrier()  # rank 0 goes first
+        if dist.get_rank() != 0:
+            torch.distributed.barrier()  # rank 0 goes first
 
-    with dnnlib.util.open_url(cfm_resume_pkl, verbose=(dist.get_rank() == 0)) as f:
-        data = pickle.load(f)
+        with dnnlib.util.open_url(cfm_resume_pkl, verbose=(dist.get_rank() == 0)) as f:
+            data = pickle.load(f)
 
-    if dist.get_rank() == 0:
-        torch.distributed.barrier()  # other ranks follow
+        if dist.get_rank() == 0:
+            torch.distributed.barrier()  # other ranks follow
 
-    # Use the EMA model from the snapshot (already has correct architecture).
-    cfm_net = data['ema'].to(device).eval().requires_grad_(False)
+        # Use the EMA model from the snapshot (already has correct architecture).
+        cfm_net = data['ema'].to(device).eval().requires_grad_(False)
 
-    # Optional: if you want to reuse augment pipe from teacher snapshot when present:
-    # if augment_pipe is None and data.get('augment_pipe', None) is not None:
-    #     augment_pipe = data['augment_pipe'].to(device).eval()
+        # Optional: if you want to reuse augment pipe from teacher snapshot when present:
+        # if augment_pipe is None and data.get('augment_pipe', None) is not None:
+        #     augment_pipe = data['augment_pipe'].to(device).eval()
 
-    del data
+        del data
+    else:
+        dist.print0('Toy QPSK mode: skipping CFM snapshot load.')
+        cfm_net = None
 
     # ------------------------------------------------------------------------
     # Construct Koopman nets.
     # ------------------------------------------------------------------------
     dist.print0('Constructing Koopman networks (psi + phases)...')
+    # In toy mode, KoopmanToyMLP doesn't take img_resolution/img_channels.
+    # interface_kwargs already contains only label_dim=0 in that case.
     psi_net = dnnlib.util.construct_class_by_name(**psi_network_kwargs, **interface_kwargs)
     psi_net.train().requires_grad_(True).to(device)
-
-    # # Manual weight scaling to prevent JVP explosion
-    # with torch.no_grad():
-    #     for name, param in psi_net.named_parameters():
-    #         # Check for standard names in Dhariwal/ADM-style blocks
-    #         if any(x in name for x in ['qkv', 'proj', 'head', 'out']):
-    #             param.data.mul_(0.01)
-    #             dist.print0(f'Scaled down: {name}')
 
     phase_net = dnnlib.util.construct_class_by_name(**phase_kwargs, label_dim=interface_kwargs['label_dim'])
     phase_net.train().requires_grad_(True).to(device)
@@ -145,14 +149,17 @@ def koopman_training_loop(
     # Optional: print summary for psi_net.
     if dist.get_rank() == 0:
         with torch.no_grad():
-            img_channels = dataset_obj.num_channels
-            img_resolution = dataset_obj.resolution
-
-            images = torch.zeros([batch_gpu, img_channels, img_resolution, img_resolution], device=device)
-
-            t = torch.ones([batch_gpu], device=device) * 0.5
-            labels = torch.zeros([batch_gpu, psi_net.label_dim], device=device)
-            misc.print_module_summary(psi_net, [images, t, labels], max_nesting=2)
+            if toy_qpsk:
+                _x = torch.zeros([batch_gpu, 2], device=device)
+                _t = torch.ones([batch_gpu, 1], device=device) * 0.5
+                misc.print_module_summary(psi_net, [_x, _t], max_nesting=2)
+            else:
+                img_channels   = dataset_obj.num_channels
+                img_resolution = dataset_obj.resolution
+                images  = torch.zeros([batch_gpu, img_channels, img_resolution, img_resolution], device=device)
+                t       = torch.ones([batch_gpu], device=device) * 0.5
+                labels  = torch.zeros([batch_gpu, psi_net.label_dim], device=device)
+                misc.print_module_summary(psi_net, [images, t, labels], max_nesting=2)
 
     # ------------------------------------------------------------------------
     # Optimizer / loss / augment / DDP / EMA.
@@ -251,9 +258,15 @@ def koopman_training_loop(
         # struct mask inside KoopmanLoss (ones for joint, upper-triangular for sequential).
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
-            images, labels = next(dataset_iterator)
-            images = images.to(device).to(torch.float32) / 127.5 - 1
-            labels = labels.to(device)
+            if toy_qpsk:
+                # In toy mode the loss generates its own clean data;
+                # we only need a dummy tensor to communicate batch_gpu.
+                images = torch.empty(batch_gpu, 1, device=device)
+                labels = None
+            else:
+                images, labels = next(dataset_iterator)
+                images = images.to(device).to(torch.float32) / 127.5 - 1
+                labels = labels.to(device)
             loss = koop_loss(
                 psi_net=psi_net,
                 phase_net=phase_net,

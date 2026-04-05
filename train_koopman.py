@@ -34,12 +34,17 @@ def parse_int_list(s):
 
 # Main options.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',           type=str, required=True)
-@click.option('--data',         help='Path to dataset', metavar='ZIP|DIR',                 type=str, required=True)
+@click.option('--data',         help='Path to dataset', metavar='ZIP|DIR',                 type=str, default=None)
 @click.option('--cond',         help='Use class labels', metavar='BOOL',                   type=bool, default=False, show_default=True)
 @click.option('--xflip',        help='Enable dataset x-flips', metavar='BOOL',             type=bool, default=False, show_default=True)
 
+# Toy QPSK mode (replaces dataset + CFM teacher with analytic 2D system).
+@click.option('--toy-qpsk',     help='Use 2D QPSK toy mode (no dataset/CFM required)', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--toy-m',        help='QPSK constellation radius m', metavar='FLOAT',       type=click.FloatRange(min=0, min_open=True), default=1.0, show_default=True)
+@click.option('--toy-hidden-dim', help='KoopmanToyMLP hidden dim', metavar='INT',          type=click.IntRange(min=1), default=256, show_default=True)
+
 # Frozen teacher CFM.
-@click.option('--cfm-pkl',      help='CFM network snapshot pickle (teacher)', metavar='PKL|URL', type=str, required=True)
+@click.option('--cfm-pkl',      help='CFM network snapshot pickle (teacher)', metavar='PKL|URL', type=str, default=None)
 
 # Koopman model choices.
 @click.option('--k',            help='Number of Koopman eigenfunctions', metavar='INT',    type=click.IntRange(min=1), default=32, show_default=True)
@@ -96,59 +101,78 @@ def main(**kwargs):
     # ----------------------------------------------------------------------
     c = dnnlib.EasyDict()
 
-    # Dataset / loader.
-    c.dataset_kwargs = dnnlib.EasyDict(
-        class_name='training.dataset.ImageFolderDataset',
-        path=opts.data,
-        use_labels=opts.cond,
-        xflip=opts.xflip,
-        cache=opts.cache,
-    )
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+    # Validate flag combinations.
+    if opts.toy_qpsk:
+        if opts.data is not None:
+            raise click.ClickException('--data is not used in --toy-qpsk mode.')
+        if opts.cfm_pkl is not None:
+            raise click.ClickException('--cfm-pkl is not used in --toy-qpsk mode.')
+        if opts.cond:
+            raise click.ClickException('--cond is not supported in --toy-qpsk mode (unconditional only).')
+    else:
+        if opts.data is None:
+            raise click.ClickException('--data is required unless --toy-qpsk=1.')
+        if opts.cfm_pkl is None:
+            raise click.ClickException('--cfm-pkl is required unless --toy-qpsk=1.')
 
-    # Validate dataset (also captures name/resolution/size).
-    try:
-        dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
-        dataset_name = dataset_obj.name
-        c.dataset_kwargs.resolution = dataset_obj.resolution
-        c.dataset_kwargs.max_size = len(dataset_obj)
-        if opts.cond and not dataset_obj.has_labels:
-            raise click.ClickException('--cond=True requires labels specified in dataset.json')
-        del dataset_obj
-    except IOError as err:
-        raise click.ClickException(f'--data: {err}')
+    if not opts.toy_qpsk:
+        # Dataset / loader.
+        c.dataset_kwargs = dnnlib.EasyDict(
+            class_name='training.dataset.ImageFolderDataset',
+            path=opts.data,
+            use_labels=opts.cond,
+            xflip=opts.xflip,
+            cache=opts.cache,
+        )
+        c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+
+        # Validate dataset (also captures name/resolution/size).
+        try:
+            dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
+            dataset_name = dataset_obj.name
+            c.dataset_kwargs.resolution = dataset_obj.resolution
+            c.dataset_kwargs.max_size = len(dataset_obj)
+            if opts.cond and not dataset_obj.has_labels:
+                raise click.ClickException('--cond=True requires labels specified in dataset.json')
+            del dataset_obj
+        except IOError as err:
+            raise click.ClickException(f'--data: {err}')
+    else:
+        # Toy mode: no real dataset.
+        c.dataset_kwargs     = dnnlib.EasyDict()   # unused by loop in toy mode
+        c.data_loader_kwargs = dnnlib.EasyDict()
+        dataset_name         = 'qpsk-toy'
 
     # ----------------------------------------------------------------------
-    # Frozen CFM net (teacher).
-    # IMPORTANT: cfm_network_kwargs must construct the SAME class you used
-    # in CFM training (e.g., training.networks.CFMPrecond).
+    # Frozen CFM net (teacher)  /  toy mode flag.
     # ----------------------------------------------------------------------
-    # c.cfm_network_kwargs = dnnlib.EasyDict()
-    # # You can keep the arch choice simple at first:
-    # # assume your teacher was trained with CFMPrecond wrapping DhariwalUNet.
-    # # If your teacher is something else, you’ll change these two lines.
-    # c.cfm_network_kwargs.class_name = 'training.networks.CFMPrecond'
-    # c.cfm_network_kwargs.model_type = 'DhariwalUNet'
-    # c.cfm_network_kwargs.model_channels = 192
-    # c.cfm_network_kwargs.channel_mult = [1, 2, 3, 4]
-    c.cfm_resume_pkl = opts.cfm_pkl
+    c.cfm_resume_pkl = opts.cfm_pkl   # None when toy_qpsk=True
+    c.toy_qpsk       = opts.toy_qpsk
 
     # ----------------------------------------------------------------------
-    # Psi network (trainable KoopmanEigenNet) + phase net.
+    # Psi network (trainable KoopmanEigenNet or KoopmanToyMLP) + phase net.
     # ----------------------------------------------------------------------
-    c.psi_network_kwargs = dnnlib.EasyDict(
-        class_name='training.koopman.KoopmanEigenNet',
-        k=opts.k,
-        use_fp16=opts.fp16,
-        model_channels=opts.cbase,
-        channel_mult=opts.cres,
-        dropout=opts.dropout,
-        # keep the rest defaults unless you want CLI flags for them:
-        channel_mult_emb=4,
-        num_blocks=3,
-        attn_resolutions=[32, 16, 8],
-        label_dropout=0,
-    )
+    if opts.toy_qpsk:
+        c.psi_network_kwargs = dnnlib.EasyDict(
+            class_name='training.koopman.KoopmanToyMLP',
+            k=opts.k,
+            hidden_dim=opts.toy_hidden_dim,
+        )
+    else:
+        c.psi_network_kwargs = dnnlib.EasyDict(
+            class_name='training.koopman.KoopmanEigenNet',
+            k=opts.k,
+            use_fp16=opts.fp16,
+            model_channels=opts.cbase,
+            channel_mult=opts.cres,
+            dropout=opts.dropout,
+            # keep the rest defaults unless you want CLI flags for them:
+            channel_mult_emb=4,
+            num_blocks=3,
+            attn_resolutions=[32, 16, 8],
+            label_dropout=0,
+        )
+
     c.phase_kwargs = dnnlib.EasyDict(
         class_name='training.koopman.KoopmanPhases',
         k=opts.k,
@@ -165,7 +189,8 @@ def main(**kwargs):
         sigma_max=80,
         t_epsilon=1e-4,
         operator_scale=opts.operator_scale,
-
+        toy_mode=opts.toy_qpsk,
+        toy_m=opts.toy_m,
     )
 
     # Optimizer.
@@ -212,7 +237,10 @@ def main(**kwargs):
     # ----------------------------------------------------------------------
     # Run dir naming (same style as EDM).
     # ----------------------------------------------------------------------
-    cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
+    if opts.toy_qpsk:
+        cond_str = 'uncond'
+    else:
+        cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
     dtype_str = 'fp16' if opts.fp16 else 'fp32'
     desc = f'{dataset_name:s}-{cond_str:s}-koopman-k{opts.k:d}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
     if opts.desc is not None:
@@ -238,9 +266,12 @@ def main(**kwargs):
     dist.print0(json.dumps(c, indent=2))
     dist.print0()
     dist.print0(f'Output directory:        {c.run_dir}')
-    dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
-    dist.print0(f'CFM teacher snapshot:    {c.cfm_resume_pkl}')
-    dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
+    if opts.toy_qpsk:
+        dist.print0(f'Toy QPSK mode:           m={opts.toy_m}')
+    else:
+        dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
+        dist.print0(f'CFM teacher snapshot:    {c.cfm_resume_pkl}')
+        dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'k:                       {opts.k}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
